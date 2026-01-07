@@ -10,14 +10,42 @@ import pickle
 import torch
 import torch.distributed as dist
 
-from pytorchvideo.layers.distributed import (  # noqa
-    cat_all_gather,
-    get_local_process_group,
-    get_local_rank,
-    get_local_size,
-    get_world_size,
-    init_distributed_training as _init_distributed_training,
-)
+# Try to import from pytorchvideo, fall back to stub implementations for single-GPU training
+try:
+    from pytorchvideo.layers.distributed import (  # noqa
+        cat_all_gather,
+        get_local_process_group,
+        get_local_rank,
+        get_local_size,
+        get_world_size,
+        init_distributed_training as _init_distributed_training,
+    )
+except ImportError:
+    # Stub implementations for single-GPU training
+    def cat_all_gather(tensor_list, dim=0):
+        """Stub: simply concatenate tensor list for single GPU."""
+        import torch
+        return torch.cat(tensor_list, dim=dim)
+
+    def get_local_process_group(size):
+        """Stub: return None for single GPU."""
+        return None
+
+    def get_local_rank():
+        """Stub: always return 0 for single GPU."""
+        return 0
+
+    def get_local_size():
+        """Stub: always return 1 for single GPU."""
+        return 1
+
+    def get_world_size():
+        """Stub: always return 1 for single GPU."""
+        return 1
+
+    def _init_distributed_training(num_gpus, shard_id):
+        """Stub: do nothing for single GPU."""
+        return False
 
 
 def init_distributed_training(cfg):

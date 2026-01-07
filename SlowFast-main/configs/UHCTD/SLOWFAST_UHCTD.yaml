@@ -1,0 +1,74 @@
+TRAIN:
+  ENABLE: True
+  DATASET: uhctd  # Match the registered class name (uhctd)
+  BATCH_SIZE: 2  # Very small batch size for video processing
+  EVAL_PERIOD: 10
+  CHECKPOINT_PERIOD: 1
+  AUTO_RESUME: True
+DATA:
+  PATH_TO_DATA_DIR: "/mnt/d/FYP/UHCTD/UHCTD Comprehensive Dataset For Camera Tampering Detection"
+  PATH_PREFIX: "/mnt/d/FYP/UHCTD/UHCTD Comprehensive Dataset For Camera Tampering Detection"
+  NUM_FRAMES: 32
+  SAMPLING_RATE: 1  # Sample every frame
+  TRAIN_JITTER_SCALES: [256, 320]
+  TRAIN_CROP_SIZE: 224
+  TEST_CROP_SIZE: 224
+  INPUT_CHANNEL_NUM: [3, 3]
+  MEAN: [0.485, 0.456, 0.406]  # ImageNet mean
+  STD: [0.229, 0.224, 0.225]   # ImageNet std
+  RANDOM_FLIP: True
+  DECODING_BACKEND: pyav
+SLOWFAST:
+  ALPHA: 4
+  BETA_INV: 8
+  FUSION_CONV_CHANNEL_RATIO: 2
+  FUSION_KERNEL_SZ: 7
+RESNET:
+  ZERO_INIT_FINAL_BN: True
+  WIDTH_PER_GROUP: 64
+  NUM_GROUPS: 1
+  DEPTH: 50
+  TRANS_FUNC: bottleneck_transform
+  STRIDE_1X1: False
+  NUM_BLOCK_TEMP_KERNEL: [[3, 3], [4, 4], [6, 6], [3, 3]]
+  SPATIAL_STRIDES: [[1, 1], [2, 2], [2, 2], [2, 2]]
+  SPATIAL_DILATIONS: [[1, 1], [1, 1], [1, 1], [1, 1]]
+NONLOCAL:
+  LOCATION: [[[], []], [[], []], [[], []], [[], []]]
+  GROUP: [[1, 1], [1, 1], [1, 1], [1, 1]]
+  INSTANTIATION: dot_product
+BN:
+  USE_PRECISE_STATS: True
+  NUM_BATCHES_PRECISE: 200
+SOLVER:
+  BASE_LR: 0.005  # Lower learning rate for smaller dataset
+  LR_POLICY: cosine
+  MAX_EPOCH: 30  # Fewer epochs for video finetuning
+  MOMENTUM: 0.9
+  WEIGHT_DECAY: 1e-4
+  WARMUP_EPOCHS: 3.0
+  WARMUP_START_LR: 0.0005
+  OPTIMIZING_METHOD: sgd
+MODEL:
+  NUM_CLASSES: 4  # Four-class classification: normal, covered, defocused, moved
+  ARCH: slowfast
+  MODEL_NAME: SlowFast
+  LOSS_FUNC: cross_entropy
+  DROPOUT_RATE: 0.5
+TEST:
+  ENABLE: True
+  DATASET: uhctd  # Match the registered class name (uhctd)
+  BATCH_SIZE: 2
+DATA_LOADER:
+  NUM_WORKERS: 0  # Sequential processing for video data
+  PIN_MEMORY: True
+NUM_GPUS: 1  # Single GPU for now
+NUM_SHARDS: 1
+RNG_SEED: 0
+OUTPUT_DIR: "/mnt/d/FYP/TamperingDetection/SlowFast-main/checkpoint"
+
+# UHCTD-specific settings
+AVA:
+  BGR: False
+DATA_LOADER:
+  ENABLE_MULTI_THREAD_DECODE: True

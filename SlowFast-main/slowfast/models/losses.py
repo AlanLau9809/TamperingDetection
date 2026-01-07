@@ -8,7 +8,34 @@ from functools import partial
 import torch
 import torch.nn as nn
 
-from pytorchvideo.losses.soft_target_cross_entropy import SoftTargetCrossEntropyLoss
+# Try to import from pytorchvideo, fall back to local implementation
+try:
+    from pytorchvideo.losses.soft_target_cross_entropy import SoftTargetCrossEntropyLoss
+except ImportError:
+    # Provide local implementation of SoftTargetCrossEntropyLoss
+    class SoftTargetCrossEntropyLoss(nn.Module):
+        """
+        Soft target cross entropy loss with optional target normalization.
+        """
+        def __init__(self, normalize_targets=True):
+            super(SoftTargetCrossEntropyLoss, self).__init__()
+            self.normalize_targets = normalize_targets
+
+        def forward(self, input, target):
+            """
+            Args:
+                input (torch.Tensor): Logits from model [N, C]
+                target (torch.Tensor): Soft targets [N, C] with values in [0, 1]
+            """
+            if self.normalize_targets:
+                # Normalize targets to sum to 1
+                target = torch.nn.functional.softmax(target, dim=1)
+
+            # KL divergence loss between input (logits) and target (soft labels)
+            log_probs = torch.nn.functional.log_softmax(input, dim=1)
+            loss = torch.sum(-target * log_probs, dim=1).mean()
+
+            return loss
 
 
 class ContrastiveLoss(nn.Module):
