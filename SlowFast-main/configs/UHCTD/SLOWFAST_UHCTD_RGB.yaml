@@ -1,7 +1,7 @@
 TRAIN:
   ENABLE: True
-  DATASET: uhctd  # Match the registered class name (uhctd)
-  BATCH_SIZE: 2  # Very small batch size for video processing
+  DATASET: uhctd
+  BATCH_SIZE: 4          # Larger than flow version — RGB only, no flow OOM
   EVAL_PERIOD: 10
   CHECKPOINT_PERIOD: 1
   AUTO_RESUME: True
@@ -9,18 +9,18 @@ DATA:
   PATH_TO_DATA_DIR: "/mnt/d/FYP/UHCTD/UHCTD Comprehensive Dataset For Camera Tampering Detection"
   PATH_PREFIX: "/mnt/d/FYP/UHCTD/UHCTD Comprehensive Dataset For Camera Tampering Detection"
   NUM_FRAMES: 32
-  SAMPLING_RATE: 1  # Sample every frame
+  SAMPLING_RATE: 2       # Sample every 2nd frame → covers 64-frame window (~21s at 3fps)
   TRAIN_JITTER_SCALES: [256, 320]
   TRAIN_CROP_SIZE: 224
   TEST_CROP_SIZE: 224
-  INPUT_CHANNEL_NUM: [3, 2]  # Slow pathway: RGB (3), Fast pathway: Optical Flow (2)
-  MEAN: [0.485, 0.456, 0.406, 0.0, 0.0]  # ImageNet mean for RGB, zero for flow
-  STD: [0.229, 0.224, 0.225, 1.0, 1.0]   # ImageNet std for RGB, unit std for flow
+  INPUT_CHANNEL_NUM: [3, 3]   # Slow: 3-ch RGB, Fast: 3-ch RGB (standard SlowFast)
+  MEAN: [0.45, 0.45, 0.45]    # Simplified mean for surveillance video
+  STD: [0.225, 0.225, 0.225]  # Simplified std for surveillance video
   RANDOM_FLIP: True
   DECODING_BACKEND: pyav
 SLOWFAST:
-  ALPHA: 4
-  BETA_INV: 8
+  ALPHA: 4              # Fast pathway is 4x frame rate of Slow
+  BETA_INV: 8           # Fast pathway has 1/8 channels of Slow
   FUSION_CONV_CHANNEL_RATIO: 2
   FUSION_KERNEL_SZ: 7
 RESNET:
@@ -41,33 +41,32 @@ BN:
   USE_PRECISE_STATS: True
   NUM_BATCHES_PRECISE: 200
 SOLVER:
-  BASE_LR: 0.005  # Lower learning rate for smaller dataset
+  BASE_LR: 0.01         # Higher LR than flow version, cosine warmup handles it
   LR_POLICY: cosine
-  MAX_EPOCH: 30  # Fewer epochs for video finetuning
+  MAX_EPOCH: 30
   MOMENTUM: 0.9
   WEIGHT_DECAY: 1e-4
   WARMUP_EPOCHS: 3.0
-  WARMUP_START_LR: 0.0005
+  WARMUP_START_LR: 0.001
   OPTIMIZING_METHOD: sgd
 MODEL:
-  NUM_CLASSES: 4  # Four-class classification: normal, covered, defocused, moved
+  NUM_CLASSES: 4        # Normal, Covered, Defocused, Moved
   ARCH: slowfast
   MODEL_NAME: SlowFast
   LOSS_FUNC: cross_entropy
   DROPOUT_RATE: 0.5
 TEST:
   ENABLE: True
-  DATASET: uhctd  # Match the registered class name (uhctd)
-  BATCH_SIZE: 2
+  DATASET: uhctd
+  BATCH_SIZE: 4
 DATA_LOADER:
   ENABLE_MULTI_THREAD_DECODE: True
-  NUM_WORKERS: 8  # Sequential processing for video data
+  NUM_WORKERS: 4
   PIN_MEMORY: True
-NUM_GPUS: 1  # Single GPU for now
+NUM_GPUS: 1
 NUM_SHARDS: 1
-RNG_SEED: 0
+RNG_SEED: 42
 OUTPUT_DIR: "/mnt/d/FYP/TamperingDetection/SlowFast-main/checkpoint"
 
-# UHCTD-specific settings
 AVA:
   BGR: False

@@ -1,443 +1,546 @@
 #!/usr/bin/env python3
 """
-UHCTD Model Evaluation Script
-Evaluates trained SlowFast model on testing videos against ground truth annotations.
+UHCTD Model Evaluation Script — Full Sliding Window Sweep
+
+Key changes vs. the old sparse-sampling version:
+  ● Every frame in the test video receives a prediction (no "default = Normal" bias).
+  ● Sliding window with configurable stride (default = window_size = no overlap).
+  ● Windows are batched on GPU for throughput efficiency.
+  ● Optical flow removed — both pathways receive RGB (matches SLOWFAST_UHCTD_RGB.yaml).
+  ● Old flow-based SLOWFAST_UHCTD.yaml still supported via --config flag for comparison.
 """
 
 import sys
 import os
+import argparse
+
 import torch
 import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-import torchvision.io as io
 from torchvision.io import VideoReader
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, precision_recall_fscore_support
+from sklearn.metrics import (
+    accuracy_score, confusion_matrix, precision_recall_fscore_support
+)
+import warnings
+warnings.filterwarnings("ignore", message=".*torchvision.*")
+warnings.filterwarnings("ignore", message=".*pyav.*")
+warnings.filterwarnings("ignore", message=".*PyTorchVideo.*")
 
-# Add SlowFast to path
-sys.path.append('SlowFast-main')
+# ── SlowFast path ────────────────────────────────────────────────────────────
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'SlowFast-main'))
 
 from slowfast.config.defaults import get_cfg
 from slowfast.models import build_model
-from slowfast.utils.checkpoint import load_checkpoint
-from slowfast.utils.misc import launch_job
-from slowfast.datasets.utils import pack_pathway_output, spatial_sampling, tensor_normalize
+from slowfast.datasets.utils import spatial_sampling
 
-def setup_model(model_path="SlowFast-main/checkpoint/best_model.pth", config_path="SlowFast-main/configs/UHCTD/SLOWFAST_UHCTD.yaml"):
-    """Load trained SlowFast model"""
-    print("Loading trained SlowFast model...")
+# ── Experiment definitions ────────────────────────────────────────────────────
+EXPERIMENTS = {
+    "E1": {"name": "Cam A Train → Cam A Test",   "test_cam": "Camera A", "gt_base": "cam_a"},
+    "E2": {"name": "Cam B Train → Cam A Test",   "test_cam": "Camera A", "gt_base": "cam_a"},
+    "E3": {"name": "Cam A+B Train → Cam A Test", "test_cam": "Camera A", "gt_base": "cam_a"},
+}
 
-    # Setup config
+CLASS_NAMES = {0: "Normal", 1: "Covered", 2: "Defocused", 3: "Moved"}
+FPS_MAP = {"Camera A": 3.0, "Camera B": 10.0}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Model setup
+# ════════════════════════════════════════════════════════════════════════════
+
+def setup_model(model_path, config_path):
+    """Load trained SlowFast model from checkpoint."""
+    print("Loading trained SlowFast model…")
+
     cfg = get_cfg()
     cfg.merge_from_file(config_path)
     cfg.freeze()
 
-    # Build and load model
     model = build_model(cfg)
 
-    if os.path.exists(model_path):
-        checkpoint = torch.load(model_path, map_location='cpu')
-        if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
-            print(f"Model loaded from checkpoint: {model_path}")
-            if 'val_accuracy' in checkpoint:
-                print(f"   Best validation accuracy during training: {checkpoint['val_accuracy']:.2f}%")
-        else:
-            print("Warning: No model_state_dict found in checkpoint, loading directly")
-            model.load_state_dict(checkpoint)
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Checkpoint not found: {model_path}")
+
+    ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
+    if 'model_state_dict' in ckpt:
+        model.load_state_dict(ckpt['model_state_dict'])
+        print(f"  Loaded checkpoint : {model_path}")
+        if 'val_accuracy' in ckpt:
+            print(f"  Val accuracy (train) : {ckpt['val_accuracy']:.2f}%")
+        if 'val_macro_f1' in ckpt:
+            print(f"  Val macro F1 (train) : {ckpt['val_macro_f1']:.4f}")
     else:
-        raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
+        model.load_state_dict(ckpt)
+        print(f"  Loaded checkpoint (raw): {model_path}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.eval()
-
-    print(f"Model ready for evaluation on device: {device}")
+    print(f"  Device: {device}")
     return model, cfg, device
 
-def preprocess_frames(frames, cfg):
-    """Preprocess frames for SlowFast (consistent with training)"""
-    # Input frames are [T, C, H, W] from VideoReader, uint8
-    frames = frames.float() / 255.0
 
-    # spatial_sampling expects [T, C, H, W] and returns [T, C, H, W]
-    frames = spatial_sampling(
-        frames,
-        spatial_idx=1,  # Center crop
-        min_scale=cfg.DATA.TEST_CROP_SIZE,
-        max_scale=cfg.DATA.TEST_CROP_SIZE,
-        crop_size=cfg.DATA.TEST_CROP_SIZE,
-        random_horizontal_flip=False,
-    )
+# ════════════════════════════════════════════════════════════════════════════
+# Frame loading  (VideoReader-based, seek by time)
+# ════════════════════════════════════════════════════════════════════════════
 
-    # Normalize manually like in the dataset class
-    mean = torch.tensor(cfg.DATA.MEAN, dtype=frames.dtype).view(1, -1, 1, 1)
-    std = torch.tensor(cfg.DATA.STD, dtype=frames.dtype).view(1, -1, 1, 1)
-    frames = (frames - mean) / std
+def _load_frames_videoreader(video_path, start_frame, n_frames, fps):
+    """
+    Load `n_frames` consecutive frames starting at `start_frame` using VideoReader.
+    Returns uint8 tensor [T, C, H, W].
+    """
+    start_pts = float(start_frame) / fps
+    frames = []
+    try:
+        reader = VideoReader(video_path, "video")
+        reader.seek(start_pts)
+        for _ in range(n_frames):
+            try:
+                frm = next(reader)
+                frames.append(frm['data'])           # [C, H, W] uint8
+            except StopIteration:
+                break
+    except Exception:
+        pass
 
-    # Permute to [C, T, H, W] for the model
-    frames = frames.permute(1, 0, 2, 3)
+    if not frames:
+        return None
 
-    # Pack for SlowFast (returns a list of tensors)
-    frames = pack_pathway_output(cfg, frames)
+    v = torch.stack(frames)  # [T, C, H, W] uint8
+    if v.shape[0] < n_frames:
+        # Pad with last frame
+        pad = v[-1:].repeat(n_frames - v.shape[0], 1, 1, 1)
+        v = torch.cat([v, pad], dim=0)
+    return v[:n_frames]
 
-    return frames
 
-def load_ground_truth(gt_path, is_4_class=False):
-    """Load ground truth annotations"""
-    df = pd.read_csv(gt_path, header=None, names=['frame', 'tamper', 'quantity', 'rate', 'status'])
+# ════════════════════════════════════════════════════════════════════════════
+# Preprocessing — RGB-only (matches both SLOWFAST_UHCTD_RGB.yaml pathways)
+# ════════════════════════════════════════════════════════════════════════════
 
-    if is_4_class:
-        # Keep all 4 classes: 0=normal, 1=covered, 2=defocused, 3=moved
-        df['label'] = df['tamper']
-    else:
-        # Convert to binary: any tampering (1,2,3) = 1, normal (0) = 0
-        df['label'] = (df['tamper'] > 0).astype(int)
+def preprocess_window_rgb(frames_tchw_uint8, cfg):
+    """
+    Preprocess a single window for RGB-only SlowFast.
 
+    Input : [T, C, H, W] uint8
+    Output: [slow[3,T/α,224,224], fast[3,T,224,224]]
+    """
+    crop_size = cfg.DATA.TEST_CROP_SIZE   # 224
+    T         = cfg.DATA.NUM_FRAMES       # 32
+    alpha     = cfg.SLOWFAST.ALPHA        # 4
+
+    # float [0,1], [T, C, H, W]
+    frames = frames_tchw_uint8.float() / 255.0
+
+    # Centre-crop / resize to 224
+    rgb_small = spatial_sampling(
+        frames, spatial_idx=1,
+        min_scale=crop_size, max_scale=crop_size, crop_size=crop_size
+    )  # [T, 3, 224, 224]
+
+    # [T, C, H, W] → [C, T, H, W]
+    rgb = rgb_small.permute(1, 0, 2, 3)  # [3, T, 224, 224]
+
+    # Normalise (use first 3 MEAN/STD values from config)
+    mean = torch.tensor(cfg.DATA.MEAN[:3]).view(-1, 1, 1, 1)
+    std  = torch.tensor(cfg.DATA.STD[:3]).view(-1, 1, 1, 1)
+    rgb  = (rgb - mean) / std
+
+    # SlowFast split
+    slow_idx = torch.linspace(0, T - 1, T // alpha, dtype=torch.long)
+    slow = rgb[:, slow_idx, :, :]   # [3, T/α, 224, 224]
+    fast = rgb                       # [3, T,   224, 224]
+
+    return slow, fast
+
+
+def preprocess_window_flow(frames_tchw_uint8, cfg):
+    """
+    Preprocess a single window for legacy RGB+Flow SlowFast.
+
+    Input : [T, C, H, W] uint8
+    Output: [slow[3,T/α,224,224], fast[2,T,224,224]]
+    """
+    import cv2
+
+    crop_size = cfg.DATA.TEST_CROP_SIZE
+    T         = cfg.DATA.NUM_FRAMES
+    alpha     = cfg.SLOWFAST.ALPHA
+
+    frames = frames_tchw_uint8.float() / 255.0
+    rgb_small = spatial_sampling(
+        frames, spatial_idx=1,
+        min_scale=crop_size, max_scale=crop_size, crop_size=crop_size
+    )  # [T, 3, 224, 224]
+
+    # ── RGB normalise ────────────────────────────────────────────────────────
+    rgb = rgb_small.permute(1, 0, 2, 3)  # [3, T, 224, 224]
+    mean_rgb = torch.tensor(cfg.DATA.MEAN[:3]).view(-1, 1, 1, 1)
+    std_rgb  = torch.tensor(cfg.DATA.STD[:3]).view(-1, 1, 1, 1)
+    rgb      = (rgb - mean_rgb) / std_rgb
+
+    # ── Optical flow ─────────────────────────────────────────────────────────
+    frames_np = (rgb_small.permute(0, 2, 3, 1).clamp(0, 1) * 255).byte().numpy()
+    H, W      = frames_np.shape[1], frames_np.shape[2]
+    flow_list = []
+    for i in range(len(frames_np) - 1):
+        f1, f2 = frames_np[i, :, :, :3], frames_np[i + 1, :, :, :3]
+        try:
+            g1 = cv2.cvtColor(f1, cv2.COLOR_RGB2GRAY)
+            g2 = cv2.cvtColor(f2, cv2.COLOR_RGB2GRAY)
+            fl = cv2.calcOpticalFlowFarneback(
+                g1, g2, None,
+                pyr_scale=0.5, levels=2, winsize=9,
+                iterations=2, poly_n=5, poly_sigma=1.2, flags=0
+            )
+            flow_list.append(fl)
+        except Exception:
+            flow_list.append(np.zeros((H, W, 2), dtype=np.float32))
+
+    flow = torch.from_numpy(np.stack(flow_list)).float()  # [T-1, H, W, 2]
+    flow = flow.permute(3, 0, 1, 2)                       # [2, T-1, H, W]
+
+    mean_fl = torch.tensor(cfg.DATA.MEAN[3:5]).view(-1, 1, 1, 1)
+    std_fl  = torch.tensor(cfg.DATA.STD[3:5]).view(-1, 1, 1, 1)
+    flow    = (flow - mean_fl) / std_fl
+
+    # Pad T-1 → T
+    if flow.shape[1] < T:
+        flow = torch.cat([flow, flow[:, -1:, :, :]], dim=1)
+
+    # Slow split
+    slow_idx = torch.linspace(0, T - 1, T // alpha, dtype=torch.long)
+    slow = rgb[:, slow_idx, :, :]   # [3, T/α, 224, 224]
+
+    return slow, flow
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Ground truth loader
+# ════════════════════════════════════════════════════════════════════════════
+
+def load_ground_truth(gt_path):
+    """Load per-frame 4-class labels from ground truth CSV."""
+    df = pd.read_csv(gt_path, header=None,
+                     names=['frame', 'tamper', 'quantity', 'rate', 'status'])
+    df['label'] = df['tamper']
     return df
 
-def predict_video_segment(model, video_path, start_frame, end_frame, cfg, device):
-    """Predict tampering class for a video segment using a memory-efficient method."""
-    try:
-        if "Camera A" in video_path:
-            fps = 3.0
-        elif "Camera B" in video_path:
-            fps = 10.0
-        else:
-            fps = 30.0
 
-        start_pts = float(start_frame) / fps
-        num_frames_to_read = end_frame - start_frame + 1
+# ════════════════════════════════════════════════════════════════════════════
+# Full-video evaluation (sliding window)
+# ════════════════════════════════════════════════════════════════════════════
 
-        frames_list = []
-        try:
-            reader = VideoReader(video_path, "video")
-        except Exception as e:
-            print(f"Critical error opening video file {video_path} with VideoReader: {e}")
-            if cfg.MODEL.NUM_CLASSES == 4:
-                return 0, np.array([1.0, 0.0, 0.0, 0.0])
-            else:
-                return 0, 0.0
+def evaluate_video_full_sweep(model, video_path, gt_df, cfg, device,
+                              window_size=32, stride=None, batch_size=8,
+                              use_flow=False):
+    """
+    Evaluate model on EVERY frame of the video using a sliding window.
 
-        try:
-            reader.seek(start_pts)
-            for _ in range(num_frames_to_read):
-                frame = next(reader)
-                frames_list.append(frame['data'])
-            v_frames = torch.stack(frames_list)
-        except StopIteration:
-            if not frames_list:
-                print(f"No frames loaded for segment {start_frame}-{end_frame} (EOF at seek)")
-                if cfg.MODEL.NUM_CLASSES == 4: return 0, np.array([1.0, 0.0, 0.0, 0.0])
-                else: return 0, 0.0
-            v_frames = torch.stack(frames_list)
-        except Exception as load_error:
-            print(f"Failed to load segment {start_frame}-{end_frame} at {start_pts:.1f}s: {load_error}")
-            if cfg.MODEL.NUM_CLASSES == 4:
-                return 0, np.array([1.0, 0.0, 0.0, 0.0])
-            else:
-                return 0, 0.0
-        
-        # v_frames from VideoReader is [T, C, H, W]
-        num_loaded_frames = v_frames.shape[0]
-        target_frames = cfg.DATA.NUM_FRAMES
-
-        if num_loaded_frames < target_frames:
-            if num_loaded_frames > 0:
-                last_frame = v_frames[-1:].repeat(target_frames - num_loaded_frames, 1, 1, 1)
-                v_frames = torch.cat([v_frames, last_frame], dim=0)
-            else:
-                # This case is handled by the error checking above, but as a fallback:
-                return 0, np.array([1.0, 0.0, 0.0, 0.0]) if cfg.MODEL.NUM_CLASSES == 4 else 0, 0.0
-        elif num_loaded_frames > target_frames:
-            indices = torch.linspace(0, num_loaded_frames - 1, target_frames, dtype=torch.long)
-            v_frames = v_frames[indices]
-        
-        frames = preprocess_frames(v_frames, cfg)
-
-        with torch.no_grad():
-            frames = [f.unsqueeze(0).to(device) for f in frames]
-            outputs = model(frames)
-
-            probs = F.softmax(outputs, dim=1)
-            preds = outputs.argmax(dim=1)
-
-            num_classes = cfg.MODEL.NUM_CLASSES
-            if num_classes == 4:
-                return preds.item(), probs[0].cpu().numpy()
-            else:
-                return preds.item(), probs[0][1].item()
-
-    except Exception as e:
-        print(f"Error processing segment {start_frame}-{end_frame}: {str(e)[:100]}...")
-        if cfg.MODEL.NUM_CLASSES == 4:
-            return 0, np.array([1.0, 0.0, 0.0, 0.0])
-        else:
-            return 0, 0.0
-
-def evaluate_video(model, video_path, gt_df, cfg, device, window_size=32, stride=16, max_samples=1000):
-    """Evaluate model on video using sliding window with sampling for memory efficiency"""
-    print(f"Evaluating video: {os.path.basename(video_path)}")
-    print(f"   Using {max_samples} sample windows for evaluation (memory efficient)")
+    Parameters
+    ----------
+    window_size : int
+        Number of frames per inference window (should match cfg.DATA.NUM_FRAMES).
+    stride : int
+        Stride between windows. Defaults to window_size (no overlap).
+        Use stride = window_size // 2 for 50 % overlap (better boundary coverage).
+    batch_size : int
+        Windows batched together for one GPU forward pass.
+    use_flow : bool
+        True  → RGB+Flow preprocessing (legacy SLOWFAST_UHCTD.yaml)
+        False → RGB-only preprocessing (SLOWFAST_UHCTD_RGB.yaml)  [default]
+    """
+    if stride is None:
+        stride = window_size   # non-overlapping by default
 
     total_frames = len(gt_df)
-    predictions = np.zeros(total_frames)
-    probabilities = np.zeros((total_frames, cfg.MODEL.NUM_CLASSES))  # Store probabilities for all classes
+    fps = FPS_MAP.get(
+        next((k for k in FPS_MAP if k in video_path), "Camera A"),
+        3.0
+    )
 
-    is_4_class = cfg.MODEL.NUM_CLASSES == 4
+    # Prediction buffers
+    # For overlapping windows, accumulate probabilities and count; take mean at the end.
+    prob_acc   = np.zeros((total_frames, cfg.MODEL.NUM_CLASSES), dtype=np.float32)
+    pred_count = np.zeros(total_frames, dtype=np.int32)
 
-    # Sample windows for evaluation instead of processing all frames
-    sampled_windows = []
+    # Build list of window start frames
+    window_starts = list(range(0, total_frames - window_size + 1, stride))
+    # Always include a window ending exactly at the last frame
+    last_start = total_frames - window_size
+    if last_start >= 0 and (not window_starts or window_starts[-1] < last_start):
+        window_starts.append(last_start)
 
-    y_labels = gt_df['label'].values
+    print(f"  Video  : {os.path.basename(video_path)}")
+    print(f"  Frames : {total_frames}, FPS={fps}, window={window_size}, stride={stride}")
+    print(f"  Windows: {len(window_starts)} "
+          f"({'no overlap' if stride == window_size else f'{stride}-frame stride'})")
+    print(f"  Batching: {batch_size} windows / forward pass")
 
-    if is_4_class:
-        # For 4-class, sample from all class types
-        for class_id in [0, 1, 2, 3]:  # Normal, Covered, Defocused, Moved
-            class_frames = np.where(y_labels == class_id)[0]
-            if len(class_frames) > max_samples // 4:
-                class_sample = np.random.choice(class_frames, max_samples // 4, replace=False)
-                for frame_idx in class_sample:
-                    start_frame = max(0, frame_idx - window_size // 2)
-                    end_frame = min(total_frames - 1, start_frame + window_size - 1)
-                    sampled_windows.append((start_frame, end_frame))
-    else:
-        # Binary case - sample normal and tampering
-        normal_frames = np.where(y_labels == 0)[0]
-        tampering_frames = np.where(y_labels == 1)[0]
+    # Batched inference
+    preprocess_fn = preprocess_window_flow if use_flow else preprocess_window_rgb
 
-        # Sample normal frames
-        if len(normal_frames) > max_samples // 2:
-            normal_sample = np.random.choice(normal_frames, max_samples // 2, replace=False)
-            for frame_idx in normal_sample:
-                start_frame = max(0, frame_idx - window_size // 2)
-                end_frame = min(total_frames - 1, start_frame + window_size - 1)
-                sampled_windows.append((start_frame, end_frame))
+    batch_slows, batch_fasts, batch_ranges = [], [], []
 
-        # Sample tampering frames
-        if len(tampering_frames) > max_samples // 2:
-            tampering_sample = np.random.choice(tampering_frames, max_samples // 2, replace=False)
-            for frame_idx in tampering_sample:
-                start_frame = max(0, frame_idx - window_size // 2)
-                end_frame = min(total_frames - 1, start_frame + window_size - 1)
-                sampled_windows.append((start_frame, end_frame))
+    def _run_batch():
+        """Run one GPU forward pass on accumulated batch."""
+        if not batch_slows:
+            return
+        slow_t = torch.stack(batch_slows).to(device)   # [B, C, T/α, H, W]
+        fast_t = torch.stack(batch_fasts).to(device)   # [B, Cf, T, H, W]
 
-    # Evaluate sampled windows
-    print(f"   Processing {len(sampled_windows)} sampled windows...")
-    for start_frame, end_frame in tqdm(sampled_windows, desc="Evaluating samples"):
+        with torch.no_grad():
+            logits = model([slow_t, fast_t])            # [B, num_classes]
+            probs  = F.softmax(logits, dim=1).cpu().numpy()
 
-        # Get model prediction for this window
-        pred_class, prob_values = predict_video_segment(
-            model, video_path, start_frame, end_frame, cfg, device
-        )
+        for b_idx, (s_f, e_f) in enumerate(batch_ranges):
+            prob_acc[s_f:e_f + 1] += probs[b_idx]
+            pred_count[s_f:e_f + 1] += 1
 
-        if is_4_class:
-            # For 4-class, assign prediction and all probabilities
-            predictions[start_frame:end_frame+1] = pred_class
-            probabilities[start_frame:end_frame+1] = prob_values  # Store all class probabilities
-        else:
-            # Binary case
-            predictions[start_frame:end_frame+1] = pred_class
-            probabilities[start_frame:end_frame+1, 1] = prob_values  # Tampering probability
+        batch_slows.clear()
+        batch_fasts.clear()
+        batch_ranges.clear()
+
+    for start_f in tqdm(window_starts, desc="  Sweeping windows", ncols=90, unit="win"):
+        end_f = min(start_f + window_size - 1, total_frames - 1)
+
+        frames = _load_frames_videoreader(video_path, start_f, window_size, fps)
+        if frames is None:
+            # Fallback: assign "Normal" probability to these frames
+            prob_acc[start_f:end_f + 1, 0] += 1.0
+            pred_count[start_f:end_f + 1] += 1
+            continue
+
+        try:
+            slow, fast = preprocess_fn(frames, cfg)
+        except Exception as e:
+            print(f"  Preprocess error at frame {start_f}: {e}")
+            prob_acc[start_f:end_f + 1, 0] += 1.0
+            pred_count[start_f:end_f + 1] += 1
+            continue
+
+        batch_slows.append(slow)
+        batch_fasts.append(fast)
+        batch_ranges.append((start_f, end_f))
+
+        if len(batch_slows) >= batch_size:
+            _run_batch()
+
+    # Flush remaining
+    _run_batch()
+
+    # ── Handle frames with no prediction (should not happen with last_start fix) ──
+    no_pred_mask = pred_count == 0
+    if no_pred_mask.any():
+        prob_acc[no_pred_mask, 0] = 1.0
+        pred_count[no_pred_mask]  = 1
+
+    # Normalise accumulated probabilities
+    probabilities = prob_acc / pred_count[:, None]     # mean probability per frame
+    predictions   = np.argmax(probabilities, axis=1)   # hard prediction per frame
 
     return predictions, probabilities
 
-def temporal_smoothing(predictions, probabilities, cfg, window_size=5):
-    """Apply temporal smoothing to reduce false positives"""
-    is_4_class = cfg.MODEL.NUM_CLASSES == 4
 
-    if is_4_class:
-        # For 4-class, smooth the probability arrays and take argmax
-        smoothed_probs = np.zeros_like(probabilities)
-        for i in range(len(probabilities)):
-            start = max(0, i - window_size // 2)
-            end = min(len(probabilities), i + window_size // 2 + 1)
-            smoothed_probs[i] = np.mean(probabilities[start:end], axis=0)
+# ════════════════════════════════════════════════════════════════════════════
+# Temporal smoothing
+# ════════════════════════════════════════════════════════════════════════════
 
-        # Take the class with highest smoothed probability
-        smoothed_predictions = np.argmax(smoothed_probs, axis=1)
-        return smoothed_predictions, smoothed_probs
-    else:
-        # Binary smoothing - keep original logic
-        smoothed = np.copy(predictions)
-        for i in range(len(predictions)):
-            start = max(0, i - window_size // 2)
-            end = min(len(predictions), i + window_size // 2 + 1)
-            smoothed[i] = np.mean(predictions[start:end])
+def temporal_smoothing(probabilities, window=15):
+    """
+    Smooth per-frame probability vectors with a box filter, then argmax.
+    window=15 at 3fps ≈ 5 seconds of context.
+    """
+    T, C = probabilities.shape
+    smoothed = np.zeros_like(probabilities)
+    for i in range(T):
+        lo = max(0, i - window // 2)
+        hi = min(T, i + window // 2 + 1)
+        smoothed[i] = probabilities[lo:hi].mean(axis=0)
+    return np.argmax(smoothed, axis=1), smoothed
 
-        # Convert back to binary
-        return (smoothed > 0.5).astype(int), None
 
-def calculate_metrics(y_true, y_pred, cfg, video_name="Video"):
-    """Calculate comprehensive evaluation metrics for 4-class or binary"""
-    is_4_class = cfg.MODEL.NUM_CLASSES == 4
+# ════════════════════════════════════════════════════════════════════════════
+# Metrics
+# ════════════════════════════════════════════════════════════════════════════
 
-    accuracy = accuracy_score(y_true, y_pred)
+def print_metrics(y_true, y_pred, tag=""):
+    """Print 4-class classification metrics."""
+    acc = accuracy_score(y_true, y_pred)
+    prec, rec, f1, _ = precision_recall_fscore_support(
+        y_true, y_pred, average='macro', zero_division=0
+    )
+    prec_c, rec_c, f1_c, _ = precision_recall_fscore_support(
+        y_true, y_pred, average=None, zero_division=0
+    )
+    cm = confusion_matrix(y_true, y_pred)
 
-    if is_4_class:
-        # 4-class: macro-average metrics
-        precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='macro')
-
-        # Per-class metrics for all 4 classes
-        precision_per_class, recall_per_class, f1_per_class, _ = precision_recall_fscore_support(y_true, y_pred, average=None)
-
-        # Confusion matrix for 4 classes
-        cm = confusion_matrix(y_true, y_pred)
-
-        class_names = {0: "Normal", 1: "Covered", 2: "Defocused", 3: "Moved"}
-
-        print(f"\n{video_name} Results (4-Class):")
-        print(f"   Overall Accuracy: {accuracy:.3f}")
-        print(f"   Macro Precision: {precision:.3f}, Macro Recall: {recall:.3f}, Macro F1: {f1:.3f}")
-
-        for i in range(4):
-            if i < len(precision_per_class):
-                class_name = class_names.get(i, f"Class {i}")
-                print(f"   {class_name} ({i}): P={precision_per_class[i]:.3f}, R={recall_per_class[i]:.3f}, F1={f1_per_class[i]:.3f}")
-
-        print(f"   Confusion Matrix (True ↓ | Predicted → ):\n{cm}")
-        print("   Classes: [0=Normal, 1=Covered, 2=Defocused, 3=Moved]")
-    else:
-        # Binary: traditional metrics
-        precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='binary')
-        precision_per_class, recall_per_class, f1_per_class, _ = precision_recall_fscore_support(y_true, y_pred, average=None)
-        cm = confusion_matrix(y_true, y_pred)
-
-        print(f"\n{video_name} Results (Binary):")
-        print(f"   Overall Accuracy: {accuracy:.3f}")
-        print(f"   Precision: {precision:.3f}, Recall: {recall:.3f}, F1-Score: {f1:.3f}")
-        print(f"   Normal Class (0): Precision={precision_per_class[0]:.3f}, Recall={recall_per_class[0]:.3f}, F1={f1_per_class[0]:.3f}")
-        if len(precision_per_class) > 1:
-            print(f"   Tampering Class (1): Precision={precision_per_class[1]:.3f}, Recall={recall_per_class[1]:.3f}, F1={f1_per_class[1]:.3f}")
-        print(f"   Confusion Matrix (True ↓ | Predicted → ):\n{cm}")
-        print("   Classes: [0=Normal, 1=Tampering]")
+    lbl = f" [{tag}]" if tag else ""
+    print(f"\n4-Class Results{lbl}:")
+    print(f"   Overall Accuracy : {acc:.3f}")
+    print(f"   Macro P={prec:.3f}  R={rec:.3f}  F1={f1:.3f}")
+    for i in range(4):
+        if i < len(prec_c):
+            print(f"   {CLASS_NAMES[i]:<12}: "
+                  f"P={prec_c[i]:.3f}  R={rec_c[i]:.3f}  F1={f1_c[i]:.3f}")
+    print(f"   Confusion Matrix (True↓ | Pred→):\n{cm}")
+    print(f"   Classes: {[f'{k}={v}' for k,v in CLASS_NAMES.items()]}")
 
     return {
-        'accuracy': accuracy,
-        'precision': precision,
-        'recall': recall,
-        'f1': f1,
-        'precision_per_class': precision_per_class,
-        'recall_per_class': recall_per_class,
-        'f1_per_class': f1_per_class,
-        'confusion_matrix': cm
+        'accuracy': acc, 'precision': prec, 'recall': rec, 'f1': f1,
+        'precision_per_class': prec_c, 'recall_per_class': rec_c,
+        'f1_per_class': f1_c, 'confusion_matrix': cm,
     }
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# Main
+# ════════════════════════════════════════════════════════════════════════════
+
 def main():
-    print("UHCTD Model Evaluation Script")
-    print("=" * 50)
+    parser = argparse.ArgumentParser(description="UHCTD SlowFast Evaluation (Full Sweep)")
+    parser.add_argument("--experiment", default="E1", choices=["E1", "E2", "E3"])
+    parser.add_argument("--model", default="SlowFast_R50_RGB",
+                        help="Model tag matching checkpoint name "
+                             "(e.g. SlowFast_R50_RGB or SlowFast_R50)")
+    parser.add_argument("--checkpoint_dir", default="SlowFast-main/checkpoint")
+    parser.add_argument("--config",
+                        default="SlowFast-main/configs/UHCTD/SLOWFAST_UHCTD_RGB.yaml",
+                        help="YAML config.  Use SLOWFAST_UHCTD_RGB.yaml for the "
+                             "RGB-only model, SLOWFAST_UHCTD.yaml for the legacy flow model.")
+    parser.add_argument("--window", type=int, default=32,
+                        help="Inference window size in frames (default: 32)")
+    parser.add_argument("--stride", type=int, default=None,
+                        help="Stride between windows. Default = window size (no overlap). "
+                             "Set to window//2 for 50%% overlap.")
+    parser.add_argument("--batch_size", type=int, default=8,
+                        help="GPU batch size for window inference (default: 8)")
+    parser.add_argument("--smooth_window", type=int, default=15,
+                        help="Temporal smoothing window in frames (default: 15 ≈ 5s at 3fps)")
+    args = parser.parse_args()
 
-    # Define the output directory for evaluation results
-    output_results_folder = "Evaluation Results"
-    os.makedirs(output_results_folder, exist_ok=True)
+    exp_info = EXPERIMENTS[args.experiment]
+    checkpoint_name = f"{args.experiment}_{args.model}_best.pth"
+    checkpoint_path = os.path.join(args.checkpoint_dir, checkpoint_name)
+    output_dir = os.path.join("Evaluation Results", f"{args.experiment}_{args.model}")
+    os.makedirs(output_dir, exist_ok=True)
 
-    # Setup model
+    print("UHCTD Model Evaluation Script — Full Sliding Window Sweep")
+    print("=" * 60)
+    print(f"Experiment  : {args.experiment} — {exp_info['name']}")
+    print(f"Model tag   : {args.model}")
+    print(f"Checkpoint  : {checkpoint_path}")
+    print(f"Config      : {args.config}")
+    print(f"Window/stride: {args.window}/{args.stride or args.window}")
+    print(f"Output dir  : {output_dir}")
+    print("=" * 60)
+
+    # ── Load model ────────────────────────────────────────────────────────────
     try:
-        model, cfg, device = setup_model()
+        model, cfg, device = setup_model(checkpoint_path, args.config)
     except Exception as e:
         print(f"Failed to load model: {e}")
         return
 
-    # Test videos and ground truth paths
-    test_base = "/mnt/d/FYP/UHCTD/UHCTD Comprehensive Dataset For Camera Tampering Detection/Camera A/Testing video"
-    gt_base = "/mnt/d/FYP/groundtruth_and_prediction/Ground_truth/cam_a"
+    # Detect if this is a flow model
+    fast_ch = cfg.DATA.INPUT_CHANNEL_NUM[1] if len(cfg.DATA.INPUT_CHANNEL_NUM) > 1 else 3
+    use_flow = (fast_ch == 2)
+    print(f"\nModel mode: {'RGB+Flow' if use_flow else 'RGB-only'} (fast_ch={fast_ch})")
 
-    # Extract camera identifier (e.g., "cam_a") from gt_base
-    cam_name = os.path.basename(gt_base)
+    # ── Dataset paths ─────────────────────────────────────────────────────────
+    uhctd_root = ("/mnt/d/FYP/UHCTD/"
+                  "UHCTD Comprehensive Dataset For Camera Tampering Detection")
+    test_base  = os.path.join(uhctd_root, exp_info['test_cam'], "Testing video")
+    gt_base    = (f"/mnt/d/FYP/groundtruth_and_prediction/"
+                  f"Ground_truth/{exp_info['gt_base']}")
+    cam_name   = exp_info['gt_base']
 
-    test_days = ["Day 3", "Day 4", "Day 5", "Day 6"]
+    test_days  = ["Day 3", "Day 4", "Day 5", "Day 6"]
     all_results = {}
 
-    print("\nStarting evaluation on test videos...")
+    print(f"\nStarting evaluation on {exp_info['test_cam']} testing videos…\n")
 
     for day in test_days:
-        print(f"\n{'='*50}")
+        print("=" * 55)
         print(f"Evaluating {day}")
 
-        # Paths
-        video_dir = os.path.join(test_base, day)
-        video_path = os.path.join(video_dir, "video.avi")
-        gt_path = os.path.join(gt_base, f"{day}.csv")
+        video_path = os.path.join(test_base, day, "video.avi")
+        gt_path    = os.path.join(gt_base, f"{day}.csv")
 
         if not os.path.exists(video_path):
-            print(f"Video not found: {video_path}")
+            print(f"  Video not found: {video_path}")
             continue
-
         if not os.path.exists(gt_path):
-            print(f"Ground truth not found: {gt_path}")
+            print(f"  Ground truth not found: {gt_path}")
             continue
 
         # Load ground truth
-        is_4_class = cfg.MODEL.NUM_CLASSES == 4
-        gt_df = load_ground_truth(gt_path, is_4_class)
+        gt_df  = load_ground_truth(gt_path)
         y_true = gt_df['label'].values
+        unique_labels, counts = np.unique(y_true, return_counts=True)
+        print(f"  Ground truth: {len(y_true)} frames total")
+        for lbl, cnt in zip(unique_labels, counts):
+            print(f"    {CLASS_NAMES.get(lbl, lbl):<12}: {cnt:6d} ({100*cnt/len(y_true):.1f}%)")
 
-        if is_4_class:
-            # For 4-class, show distribution of all classes
-            unique_labels, counts = np.unique(y_true, return_counts=True)
-            class_names = {0: "Normal", 1: "Covered", 2: "Defocused", 3: "Moved"}
-            print(f"Ground truth loaded: {len(y_true)} frames")
-            for label, count in zip(unique_labels, counts):
-                class_name = class_names.get(label, f"Class {label}")
-                percentage = (count / len(y_true)) * 100
-                print(f"   {class_name}: {count} frames ({percentage:.1f}%)")
-        else:
-            # Binary case
-            print(f"Ground truth loaded: {len(y_true)} frames")
-            print(f"   Normal frames: {np.sum(y_true == 0)}, Tampering frames: {np.sum(y_true == 1)}")
+        # ── Full sliding window inference ─────────────────────────────────────
+        predictions, probabilities = evaluate_video_full_sweep(
+            model, video_path, gt_df, cfg, device,
+            window_size=args.window,
+            stride=args.stride,
+            batch_size=args.batch_size,
+            use_flow=use_flow,
+        )
 
-        # Evaluate video
-        predictions, probabilities = evaluate_video(model, video_path, gt_df, cfg, device)
+        # ── Temporal smoothing ───────────────────────────────────────────────
+        smoothed_preds, smoothed_probs = temporal_smoothing(
+            probabilities, window=args.smooth_window
+        )
 
-        # Apply temporal smoothing
-        if is_4_class:
-            smoothed_predictions, smoothed_probabilities = temporal_smoothing(predictions, probabilities, cfg, window_size=5)
-        else:
-            smoothed_predictions, _ = temporal_smoothing(predictions, probabilities, cfg, window_size=5)
-
-        # Calculate metrics for both raw and smoothed predictions
+        # ── Metrics ──────────────────────────────────────────────────────────
         results = {}
-        results['raw'] = calculate_metrics(y_true, predictions, cfg, f"{day} (Raw)")
-        results['smoothed'] = calculate_metrics(y_true, smoothed_predictions, cfg, f"{day} (Smoothed)")
-
+        results['raw']      = print_metrics(y_true, predictions,      tag="Raw")
+        results['smoothed'] = print_metrics(y_true, smoothed_preds,   tag="Smoothed")
         all_results[day] = results
 
-        # Save predictions for analysis
-        output_dict = {
-            'frame': gt_df['frame'],
-            'true_label': y_true,
-            'tamper_type': gt_df['tamper'],
-            'raw_prediction': predictions,
-            'smoothed_prediction': smoothed_predictions
-        }
+        # ── Save CSV ─────────────────────────────────────────────────────────
+        out_df = pd.DataFrame({
+            'frame':               gt_df['frame'],
+            'true_label':          y_true,
+            'tamper_type':         gt_df['tamper'],
+            'raw_prediction':      predictions,
+            'smoothed_prediction': smoothed_preds,
+            'normal_prob':         probabilities[:, 0],
+            'covered_prob':        probabilities[:, 1],
+            'defocused_prob':      probabilities[:, 2],
+            'moved_prob':          probabilities[:, 3],
+        })
+        csv_name = f"eval_{args.experiment}_{args.model}_{cam_name}_{day}.csv"
+        csv_path = os.path.join(output_dir, csv_name)
+        out_df.to_csv(csv_path, index=False)
+        print(f"  Saved: {csv_path}")
 
-        if is_4_class:
-            # For 4-class, add individual probability columns
-            output_dict['normal_prob'] = probabilities[:, 0]
-            output_dict['covered_prob'] = probabilities[:, 1]
-            output_dict['defocused_prob'] = probabilities[:, 2]
-            output_dict['moved_prob'] = probabilities[:, 3]
-        else:
-            # For binary, add tampering probability
-            output_dict['tampering_probability'] = probabilities[:, 1]
-
-        output_df = pd.DataFrame(output_dict)
-        output_path = os.path.join(output_results_folder, f"evaluation_results_{cam_name}_{day}.csv")
-        output_df.to_csv(output_path, index=False)
-        print(f"Predictions saved to: {output_path}")
-
-    # Overall summary
+    # ── Overall summary ───────────────────────────────────────────────────────
     print(f"\n{'='*60}")
     print("OVERALL EVALUATION SUMMARY")
     print(f"{'='*60}")
+    for day, res in all_results.items():
+        r  = res['raw']
+        sm = res['smoothed']
+        print(f"{day}:")
+        print(f"  Raw      — Acc={r['accuracy']:.3f}  "
+              f"P={r['precision']:.3f}  R={r['recall']:.3f}  F1={r['f1']:.3f}")
+        print(f"  Smoothed — Acc={sm['accuracy']:.3f}  "
+              f"P={sm['precision']:.3f}  R={sm['recall']:.3f}  F1={sm['f1']:.3f}")
+        # Per-class recall
+        print(f"  Recall per class (smoothed): "
+              + "  ".join(f"{CLASS_NAMES[i]}={sm['recall_per_class'][i]:.3f}"
+                          for i in range(4) if i < len(sm['recall_per_class'])))
 
-    for day, results in all_results.items():
-        raw_acc = results['raw']['accuracy']
-        smooth_acc = results['smoothed']['accuracy']
-        print(f"{day}: Raw={raw_acc:.3f}, Smoothed={smooth_acc:.3f}")
+    print("\nEvaluation complete!")
+    print(f"Results in: {output_dir}")
 
-    print("\nEvaluation complete! Check the generated CSV files for detailed analysis.")
 
 if __name__ == "__main__":
     main()

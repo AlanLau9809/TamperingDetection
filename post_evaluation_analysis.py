@@ -142,23 +142,38 @@ def plot_precision_recall_curve(y_true, y_score, class_names, title, save_path):
     plt.close()
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Post-Evaluation Analysis")
+    parser.add_argument("--results_dir", type=str, default=None,
+                        help="Path to experiment results folder, e.g. 'Evaluation Results/E1_SlowFast_R50'. "
+                             "If omitted, scans top-level 'Evaluation Results/' for legacy CSV files.")
+    args = parser.parse_args()
+
     print("Post-Evaluation Analysis Script")
     print("================================")
 
-    results_dir = "./Evaluation Results"
+    if args.results_dir:
+        results_dir = args.results_dir
+    else:
+        results_dir = "./Evaluation Results"
+
     output_plots_dir = os.path.join(results_dir, "Analysis Plots")
     os.makedirs(output_plots_dir, exist_ok=True)
+
+    print(f"Results directory : {results_dir}")
+    print(f"Plots directory   : {output_plots_dir}")
 
     # Assuming 4-class for current context
     class_names = {0: "Normal", 1: "Covered", 2: "Defocused", 3: "Moved"}
 
     all_day_metrics = [] # To store metrics for overall summary
 
-    # Dynamically find all evaluation result CSVs
-    csv_files = [f for f in os.listdir(results_dir) if f.startswith("evaluation_results_") and f.endswith(".csv")]
-    
+    # Find all CSV files in the given directory (supports both naming conventions)
+    csv_files = [f for f in os.listdir(results_dir)
+                 if (f.startswith("eval_") or f.startswith("evaluation_results_")) and f.endswith(".csv")]
+
     if not csv_files:
-        print(f"No CSV files found in {results_dir}. Please ensure evaluation has been run.")
+        print(f"No CSV files found in '{results_dir}'. Please ensure evaluation has been run.")
         return
 
     print(f"Found {len(csv_files)} evaluation result files in '{results_dir}'.")
@@ -235,16 +250,21 @@ def main():
         print(f"File: {metrics['file']}")
         print(f"  Accuracy: {metrics['accuracy']:.3f}, P: {metrics['precision']:.3f}, R: {metrics['recall']:.3f}, F1: {metrics['f1']:.3f}")
     
-    # Optional: Plot overall trends if needed
+    # Optional: Plot overall trends if needed (extract day number from filename)
     if len(all_day_metrics) > 1:
         metrics_df = pd.DataFrame(all_day_metrics)
-        metrics_df['Day'] = metrics_df['file'].apply(lambda x: int(x.split('_Day ')[1].split('.')[0]))
+        import re
+        def extract_day(filename):
+            m = re.search(r'Day[_ ](\d+)', filename)
+            return int(m.group(1)) if m else 0
+        metrics_df['Day'] = metrics_df['file'].apply(extract_day)
         metrics_df = metrics_df.sort_values('Day')
 
         plt.figure(figsize=(10, 6))
         for metric in ['accuracy', 'precision', 'recall', 'f1']:
             plt.plot(metrics_df['Day'], metrics_df[metric], marker='o', label=metric.replace('_', ' ').title())
-        plt.title('Performance Metrics Across Evaluation Days')
+        exp_label = os.path.basename(results_dir)
+        plt.title(f'Performance Metrics Across Evaluation Days — {exp_label}')
         plt.xlabel('Day')
         plt.ylabel('Score')
         plt.xticks(metrics_df['Day'])
