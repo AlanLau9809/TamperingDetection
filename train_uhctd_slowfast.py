@@ -57,8 +57,28 @@ EXPERIMENTS = {
 
 DEFAULT_CONFIG = "SlowFast-main/configs/UHCTD/SLOWFAST_UHCTD_RGB.yaml"
 
+# Auto-detect the fast-pathway mode from the config filename.
+# The env var is read by uhctd_dataset.py at dataset construction time.
+def _set_fast_mode_from_config(config_path):
+    """
+    Inspect config filename and set UHCTD_FAST_MODE accordingly.
+      *REFDIFF* → 'refdiff'
+      *RGB*     → 'rgb'
+      otherwise → leave unset (falls back to INPUT_CHANNEL_NUM detection)
+    """
+    upper = os.path.basename(config_path).upper()
+    if 'REFDIFF' in upper:
+        os.environ['UHCTD_FAST_MODE'] = 'refdiff'
+    elif 'RGB' in upper:
+        os.environ['UHCTD_FAST_MODE'] = 'rgb'
+    # else: leave existing env var (or unset → dataset auto-detects from channel count)
+    mode = os.environ.get('UHCTD_FAST_MODE', '<auto from INPUT_CHANNEL_NUM>')
+    print(f"Fast-pathway mode: UHCTD_FAST_MODE={mode}")
+
 
 def setup_config(config_path):
+    _set_fast_mode_from_config(config_path)
+
     cfg = get_cfg()
 
     if not os.path.exists(config_path):

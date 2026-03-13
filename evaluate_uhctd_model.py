@@ -117,6 +117,26 @@ def _load_frames_videoreader(video_path, start_frame, n_frames, fps):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Reference frame computation (refdiff mode)
+# ════════════════════════════════════════════════════════════════════════════
+
+def compute_reference_frame(video_path, fps, n_frames=100):
+    """
+    Compute reference frame for refdiff mode.
+    Returns the mean of the first `n_frames` frames as float32 [3, H, W] in [0,1].
+    Falls back to grey if loading fails.
+    """
+    frames = _load_frames_videoreader(video_path, 0, n_frames, fps)
+    if frames is None:
+        print(f"  Warning: Could not load reference frames from {video_path}. Using grey.")
+        return torch.full((3, 480, 704), 0.5, dtype=torch.float32)   # fallback
+
+    # frames: [T, C, H, W] uint8  →  mean in [0,1]
+    ref = frames.float().mean(dim=0) / 255.0   # [C, H, W]
+    return ref  # [3, H, W]
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # Preprocessing — RGB-only (matches both SLOWFAST_UHCTD_RGB.yaml pathways)
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -152,6 +172,55 @@ def preprocess_window_rgb(frames_tchw_uint8, cfg):
     slow_idx = torch.linspace(0, T - 1, T // alpha, dtype=torch.long)
     slow = rgb[:, slow_idx, :, :]   # [3, T/α, 224, 224]
     fast = rgb                       # [3, T,   224, 224]
+
+    return slow, fast
+
+
+def preprocess_window_refdiff(frames_tchw_uint8, cfg, reference_frame):
+    """
+    Preprocess a single window for Reference Difference Map SlowFast.
+
+    Input : [T, C, H, W] uint8, reference_frame: [3, H_orig, W_orig] float32 [0,1]
+    Output: [slow[3,T/α,224,224], fast[3,T,224,224]]
+
+    The fast pathway receives |frame_t − reference_frame| (spatial change from normal).
+    """
+    crop_size = cfg.DATA.TEST_CROP_SIZE   # 224
+    T         = cfg.DATA.NUM_FRAMES       # 32
+    alpha     = cfg.SLOWFAST.ALPHA        # 4
+
+    # float [0,1], centre-crop to 224
+    frames = frames_tchw_uint8.float() / 255.0
+    rgb_small = spatial_sampling(
+        frames, spatial_idx=1,
+        min_scale=crop_size, max_scale=crop_size, crop_size=crop_size
+    )  # [T, 3, 224, 224]
+
+    # Resize reference to crop_size if needed
+    H, W = rgb_small.shape[2], rgb_small.shape[3]
+    ref = reference_frame  # [3, H_orig, W_orig]
+    if ref.shape[1] != H or ref.shape[2] != W:
+        ref = torch.nn.functional.interpolate(
+            ref.unsqueeze(0), size=(H, W), mode='bilinear', align_corners=False
+        ).squeeze(0)   # [3, H, W]
+
+    # Compute per-frame absolute difference → [T, 3, H, W]
+    diff = torch.abs(rgb_small - ref.unsqueeze(0))      # broadcasts [1,3,H,W]
+
+    # [T, C, H, W] → [C, T, H, W]
+    rgb  = rgb_small.permute(1, 0, 2, 3)   # [3, T, 224, 224]
+    diff = diff.permute(1, 0, 2, 3)         # [3, T, 224, 224]
+
+    # Normalise
+    mean = torch.tensor(cfg.DATA.MEAN[:3]).view(-1, 1, 1, 1)
+    std  = torch.tensor(cfg.DATA.STD[:3]).view(-1, 1, 1, 1)
+    rgb  = (rgb  - mean) / std
+    diff = (diff - mean) / std
+
+    # Slow: subsampled RGB, Fast: full diff
+    slow_idx = torch.linspace(0, T - 1, T // alpha, dtype=torch.long)
+    slow = rgb[:, slow_idx, :, :]   # [3, T/α, 224, 224]
+    fast = diff                      # [3, T,   224, 224]
 
     return slow, fast
 
@@ -235,7 +304,8 @@ def load_ground_truth(gt_path):
 
 def evaluate_video_full_sweep(model, video_path, gt_df, cfg, device,
                               window_size=32, stride=None, batch_size=8,
-                              use_flow=False):
+                              use_flow=False, use_refdiff=False,
+                              reference_frame=None):
     """
     Evaluate model on EVERY frame of the video using a sliding window.
 
@@ -245,12 +315,14 @@ def evaluate_video_full_sweep(model, video_path, gt_df, cfg, device,
         Number of frames per inference window (should match cfg.DATA.NUM_FRAMES).
     stride : int
         Stride between windows. Defaults to window_size (no overlap).
-        Use stride = window_size // 2 for 50 % overlap (better boundary coverage).
     batch_size : int
         Windows batched together for one GPU forward pass.
     use_flow : bool
-        True  → RGB+Flow preprocessing (legacy SLOWFAST_UHCTD.yaml)
-        False → RGB-only preprocessing (SLOWFAST_UHCTD_RGB.yaml)  [default]
+        True → RGB+Flow preprocessing (legacy SLOWFAST_UHCTD.yaml)
+    use_refdiff : bool
+        True → Reference Difference Map preprocessing (SLOWFAST_UHCTD_REFDIFF.yaml)
+    reference_frame : torch.Tensor or None
+        Float32 [3, H, W] in [0,1]. Required when use_refdiff=True.
     """
     if stride is None:
         stride = window_size   # non-overlapping by default
@@ -280,7 +352,12 @@ def evaluate_video_full_sweep(model, video_path, gt_df, cfg, device,
     print(f"  Batching: {batch_size} windows / forward pass")
 
     # Batched inference
-    preprocess_fn = preprocess_window_flow if use_flow else preprocess_window_rgb
+    if use_refdiff:
+        preprocess_fn = lambda f, c: preprocess_window_refdiff(f, c, reference_frame)
+    elif use_flow:
+        preprocess_fn = preprocess_window_flow
+    else:
+        preprocess_fn = preprocess_window_rgb
 
     batch_slows, batch_fasts, batch_ranges = [], [], []
 
@@ -444,10 +521,21 @@ def main():
         print(f"Failed to load model: {e}")
         return
 
-    # Detect if this is a flow model
-    fast_ch = cfg.DATA.INPUT_CHANNEL_NUM[1] if len(cfg.DATA.INPUT_CHANNEL_NUM) > 1 else 3
-    use_flow = (fast_ch == 2)
-    print(f"\nModel mode: {'RGB+Flow' if use_flow else 'RGB-only'} (fast_ch={fast_ch})")
+    # Detect fast pathway mode (env var takes priority, then config filename, then channel count)
+    env_mode = os.environ.get('UHCTD_FAST_MODE', '').strip().lower()
+    fast_ch  = cfg.DATA.INPUT_CHANNEL_NUM[1] if len(cfg.DATA.INPUT_CHANNEL_NUM) > 1 else 3
+    if env_mode in ('rgb', 'refdiff', 'flow'):
+        fast_mode = env_mode
+    elif 'REFDIFF' in args.config.upper():
+        fast_mode = 'refdiff'
+    elif fast_ch == 2:
+        fast_mode = 'flow'
+    else:
+        fast_mode = 'rgb'
+
+    use_flow    = (fast_mode == 'flow')
+    use_refdiff = (fast_mode == 'refdiff')
+    print(f"\nModel mode: {fast_mode}  (fast_ch={fast_ch}, UHCTD_FAST_MODE='{env_mode}')")
 
     # ── Dataset paths ─────────────────────────────────────────────────────────
     uhctd_root = ("/mnt/d/FYP/UHCTD/"
@@ -484,6 +572,17 @@ def main():
         for lbl, cnt in zip(unique_labels, counts):
             print(f"    {CLASS_NAMES.get(lbl, lbl):<12}: {cnt:6d} ({100*cnt/len(y_true):.1f}%)")
 
+        # ── Pre-compute reference frame (refdiff mode only) ───────────────────
+        reference_frame = None
+        if use_refdiff:
+            fps_val = FPS_MAP.get(
+                next((k for k in FPS_MAP if k in video_path), "Camera A"), 3.0
+            )
+            print(f"  Computing reference frame from first 100 frames…")
+            reference_frame = compute_reference_frame(video_path, fps_val, n_frames=100)
+            print(f"  Reference frame shape: {reference_frame.shape}, "
+                  f"mean pixel: {reference_frame.mean():.3f}")
+
         # ── Full sliding window inference ─────────────────────────────────────
         predictions, probabilities = evaluate_video_full_sweep(
             model, video_path, gt_df, cfg, device,
@@ -491,6 +590,8 @@ def main():
             stride=args.stride,
             batch_size=args.batch_size,
             use_flow=use_flow,
+            use_refdiff=use_refdiff,
+            reference_frame=reference_frame,
         )
 
         # ── Temporal smoothing ───────────────────────────────────────────────
