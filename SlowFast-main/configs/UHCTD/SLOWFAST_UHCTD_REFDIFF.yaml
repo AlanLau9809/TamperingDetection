@@ -1,0 +1,74 @@
+TRAIN:
+  ENABLE: True
+  DATASET: uhctd
+  BATCH_SIZE: 4
+  EVAL_PERIOD: 10
+  CHECKPOINT_PERIOD: 1
+  AUTO_RESUME: True
+DATA:
+  PATH_TO_DATA_DIR: "/mnt/d/FYP/UHCTD/UHCTD Comprehensive Dataset For Camera Tampering Detection"
+  PATH_PREFIX: "/mnt/d/FYP/UHCTD/UHCTD Comprehensive Dataset For Camera Tampering Detection"
+  NUM_FRAMES: 32
+  SAMPLING_RATE: 2      # covers 64-frame window (~21s at 3fps)
+  TRAIN_JITTER_SCALES: [256, 320]
+  TRAIN_CROP_SIZE: 224
+  TEST_CROP_SIZE: 224
+  INPUT_CHANNEL_NUM: [3, 3]   # Slow: 3-ch RGB, Fast: 3-ch RefDiff (|frame_t - ref|)
+  MEAN: [0.45, 0.45, 0.45]
+  STD: [0.225, 0.225, 0.225]
+  RANDOM_FLIP: True
+  DECODING_BACKEND: pyav
+SLOWFAST:
+  ALPHA: 4
+  BETA_INV: 8
+  FUSION_CONV_CHANNEL_RATIO: 2
+  FUSION_KERNEL_SZ: 7
+RESNET:
+  ZERO_INIT_FINAL_BN: True
+  WIDTH_PER_GROUP: 64
+  NUM_GROUPS: 1
+  DEPTH: 50
+  TRANS_FUNC: bottleneck_transform
+  STRIDE_1X1: False
+  NUM_BLOCK_TEMP_KERNEL: [[3, 3], [4, 4], [6, 6], [3, 3]]
+  SPATIAL_STRIDES: [[1, 1], [2, 2], [2, 2], [2, 2]]
+  SPATIAL_DILATIONS: [[1, 1], [1, 1], [1, 1], [1, 1]]
+NONLOCAL:
+  LOCATION: [[[], []], [[], []], [[], []], [[], []]]
+  GROUP: [[1, 1], [1, 1], [1, 1], [1, 1]]
+  INSTANTIATION: dot_product
+BN:
+  USE_PRECISE_STATS: True
+  NUM_BATCHES_PRECISE: 200
+SOLVER:
+  BASE_LR: 0.01
+  LR_POLICY: cosine
+  MAX_EPOCH: 30
+  MOMENTUM: 0.9
+  WEIGHT_DECAY: 1e-4
+  WARMUP_EPOCHS: 3.0
+  WARMUP_START_LR: 0.001
+  OPTIMIZING_METHOD: sgd
+MODEL:
+  NUM_CLASSES: 4
+  ARCH: slowfast
+  MODEL_NAME: SlowFast
+  LOSS_FUNC: cross_entropy
+  DROPOUT_RATE: 0.5
+TEST:
+  ENABLE: True
+  DATASET: uhctd
+  BATCH_SIZE: 4
+DATA_LOADER:
+  ENABLE_MULTI_THREAD_DECODE: True
+  NUM_WORKERS: 4
+  PIN_MEMORY: True
+NUM_GPUS: 1
+NUM_SHARDS: 1
+RNG_SEED: 42
+OUTPUT_DIR: "/mnt/d/FYP/TamperingDetection/SlowFast-main/checkpoint"
+
+# Note: Set UHCTD_FAST_MODE=refdiff environment variable when using this config.
+# The dataset loader reads this env var to switch from RGB to RefDiff fast pathway.
+AVA:
+  BGR: False

@@ -120,20 +120,53 @@ def _load_frames_videoreader(video_path, start_frame, n_frames, fps):
 # Reference frame computation (refdiff mode)
 # ════════════════════════════════════════════════════════════════════════════
 
-def compute_reference_frame(video_path, fps, n_frames=100):
+def compute_multi_reference_frames(video_path, fps, gt_df, n_refs=4, n_frames_each=50):
     """
-    Compute reference frame for refdiff mode.
-    Returns the mean of the first `n_frames` frames as float32 [3, H, W] in [0,1].
-    Falls back to grey if loading fails.
-    """
-    frames = _load_frames_videoreader(video_path, 0, n_frames, fps)
-    if frames is None:
-        print(f"  Warning: Could not load reference frames from {video_path}. Using grey.")
-        return torch.full((3, 480, 704), 0.5, dtype=torch.float32)   # fallback
+    Compute n_refs reference frames spread evenly across Normal frames in the video.
 
-    # frames: [T, C, H, W] uint8  →  mean in [0,1]
-    ref = frames.float().mean(dim=0) / 255.0   # [C, H, W]
-    return ref  # [3, H, W]
+    Using multiple references that cover different times of day solves the
+    illumination-drift problem: a Normal frame under afternoon lighting will have
+    near-zero diff against the afternoon reference, even if it differs from the
+    morning reference.
+
+    Strategy:
+      1. Find all Normal (label==0) frame indices from gt_df.
+      2. Evenly sample n_refs positions across them.
+      3. Load n_frames_each consecutive frames around each position, take mean.
+
+    Returns list of float32 [3, H, W] tensors in [0,1].
+    Falls back to a single grey frame if loading fails entirely.
+    """
+    normal_indices = np.where(gt_df['label'].values == 0)[0]
+
+    if len(normal_indices) == 0:
+        print("  Warning: No Normal frames in gt_df. Using single grey reference.")
+        return [torch.full((3, 480, 704), 0.5, dtype=torch.float32)]
+
+    # Evenly spaced anchor positions within the Normal frames
+    anchor_positions = np.linspace(0, len(normal_indices) - 1, n_refs, dtype=int)
+    anchor_frames    = [int(normal_indices[p]) for p in anchor_positions]
+
+    refs = []
+    half = n_frames_each // 2
+
+    for anchor in anchor_frames:
+        start = max(0, anchor - half)
+        v = _load_frames_videoreader(video_path, start, n_frames_each, fps)
+        if v is None or v.shape[0] == 0:
+            # Skip failed loads; will fall back to fewer refs
+            continue
+        ref = v.float().mean(dim=0) / 255.0   # [3, H, W]
+        refs.append(ref)
+
+    if not refs:
+        print("  Warning: All reference frame loads failed. Using grey.")
+        return [torch.full((3, 480, 704), 0.5, dtype=torch.float32)]
+
+    unique_times = [int(anchor_frames[i]) for i in range(len(refs))]
+    print(f"  Multi-reference: {len(refs)} refs at Normal frames "
+          f"{unique_times} (out of {len(normal_indices)} Normal frames)")
+    return refs   # list of [3, H, W]
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -176,36 +209,59 @@ def preprocess_window_rgb(frames_tchw_uint8, cfg):
     return slow, fast
 
 
-def preprocess_window_refdiff(frames_tchw_uint8, cfg, reference_frame):
+def preprocess_window_refdiff(frames_tchw_uint8, cfg, reference_frames):
     """
-    Preprocess a single window for Reference Difference Map SlowFast.
+    Preprocess a single window for Multi-Reference Difference Map SlowFast.
 
-    Input : [T, C, H, W] uint8, reference_frame: [3, H_orig, W_orig] float32 [0,1]
+    Input : [T, C, H, W] uint8
+            reference_frames: list of float32 [3, H_orig, W_orig] in [0,1]
     Output: [slow[3,T/α,224,224], fast[3,T,224,224]]
 
-    The fast pathway receives |frame_t − reference_frame| (spatial change from normal).
+    Fast pathway = pixel-wise MINIMUM absolute difference across all references:
+        fast[t] = min_k( |frame_t − reference_k| )
+
+    A Normal frame under *any* lighting will match at least one reference →
+    near-zero diff. A tampered frame (covered/defocused/moved) will have large
+    diff against ALL references → correctly predicted as tampered.
     """
     crop_size = cfg.DATA.TEST_CROP_SIZE   # 224
     T         = cfg.DATA.NUM_FRAMES       # 32
     alpha     = cfg.SLOWFAST.ALPHA        # 4
 
     # float [0,1], centre-crop to 224
-    frames = frames_tchw_uint8.float() / 255.0
+    frames    = frames_tchw_uint8.float() / 255.0
     rgb_small = spatial_sampling(
         frames, spatial_idx=1,
         min_scale=crop_size, max_scale=crop_size, crop_size=crop_size
     )  # [T, 3, 224, 224]
 
-    # Resize reference to crop_size if needed
     H, W = rgb_small.shape[2], rgb_small.shape[3]
-    ref = reference_frame  # [3, H_orig, W_orig]
-    if ref.shape[1] != H or ref.shape[2] != W:
-        ref = torch.nn.functional.interpolate(
-            ref.unsqueeze(0), size=(H, W), mode='bilinear', align_corners=False
-        ).squeeze(0)   # [3, H, W]
 
-    # Compute per-frame absolute difference → [T, 3, H, W]
-    diff = torch.abs(rgb_small - ref.unsqueeze(0))      # broadcasts [1,3,H,W]
+    # ── Per-frame luminance whitening ────────────────────────────────────────
+    # Matches the training-time whitening in uhctd_dataset.py.
+    # Dividing by per-frame mean brightness makes diff brightness-invariant:
+    # a Normal frame under different lighting still gives near-zero whitened diff.
+    def _whiten(t):  # [T, 3, H, W] or [1, 3, H, W]
+        mu = t.mean(dim=[2, 3], keepdim=True).clamp(min=1e-6)
+        return t / mu
+
+    rgb_whitened = _whiten(rgb_small)   # [T, 3, H, W]
+
+    # For each reference, compute whitened absolute diff → pixel-wise minimum
+    diff_maps = []
+    for ref in reference_frames:
+        if ref.shape[1] != H or ref.shape[2] != W:
+            ref = torch.nn.functional.interpolate(
+                ref.unsqueeze(0), size=(H, W), mode='bilinear', align_corners=False
+            ).squeeze(0)
+        ref_whitened = _whiten(ref.unsqueeze(0))               # [1, 3, H, W]
+        d = torch.abs(rgb_whitened - ref_whitened)             # [T, 3, H, W]
+        diff_maps.append(d)
+
+    if len(diff_maps) == 1:
+        diff = diff_maps[0]                                     # [T, 3, H, W]
+    else:
+        diff = torch.stack(diff_maps, dim=0).min(dim=0).values # [T, 3, H, W]
 
     # [T, C, H, W] → [C, T, H, W]
     rgb  = rgb_small.permute(1, 0, 2, 3)   # [3, T, 224, 224]
@@ -217,7 +273,7 @@ def preprocess_window_refdiff(frames_tchw_uint8, cfg, reference_frame):
     rgb  = (rgb  - mean) / std
     diff = (diff - mean) / std
 
-    # Slow: subsampled RGB, Fast: full diff
+    # Slow: subsampled RGB, Fast: min-diff map
     slow_idx = torch.linspace(0, T - 1, T // alpha, dtype=torch.long)
     slow = rgb[:, slow_idx, :, :]   # [3, T/α, 224, 224]
     fast = diff                      # [3, T,   224, 224]
@@ -305,7 +361,7 @@ def load_ground_truth(gt_path):
 def evaluate_video_full_sweep(model, video_path, gt_df, cfg, device,
                               window_size=32, stride=None, batch_size=8,
                               use_flow=False, use_refdiff=False,
-                              reference_frame=None):
+                              reference_frames=None):
     """
     Evaluate model on EVERY frame of the video using a sliding window.
 
@@ -320,9 +376,9 @@ def evaluate_video_full_sweep(model, video_path, gt_df, cfg, device,
     use_flow : bool
         True → RGB+Flow preprocessing (legacy SLOWFAST_UHCTD.yaml)
     use_refdiff : bool
-        True → Reference Difference Map preprocessing (SLOWFAST_UHCTD_REFDIFF.yaml)
-    reference_frame : torch.Tensor or None
-        Float32 [3, H, W] in [0,1]. Required when use_refdiff=True.
+        True → Multi-Reference Difference Map preprocessing.
+    reference_frames : list[torch.Tensor] or None
+        List of float32 [3, H, W] in [0,1]. Required when use_refdiff=True.
     """
     if stride is None:
         stride = window_size   # non-overlapping by default
@@ -353,7 +409,7 @@ def evaluate_video_full_sweep(model, video_path, gt_df, cfg, device,
 
     # Batched inference
     if use_refdiff:
-        preprocess_fn = lambda f, c: preprocess_window_refdiff(f, c, reference_frame)
+        preprocess_fn = lambda f, c: preprocess_window_refdiff(f, c, reference_frames)
     elif use_flow:
         preprocess_fn = preprocess_window_flow
     else:
@@ -496,6 +552,11 @@ def main():
                         help="GPU batch size for window inference (default: 8)")
     parser.add_argument("--smooth_window", type=int, default=15,
                         help="Temporal smoothing window in frames (default: 15 ≈ 5s at 3fps)")
+    parser.add_argument("--num_refs", type=int, default=1,
+                        help="Number of reference frames for refdiff mode (default: 1). "
+                             "Uses the first Normal frames as reference. "
+                             "Luminance whitening handles lighting drift, so 1 is usually "
+                             "sufficient. Set >1 only with a whitening-trained model.")
     args = parser.parse_args()
 
     exp_info = EXPERIMENTS[args.experiment]
@@ -572,16 +633,17 @@ def main():
         for lbl, cnt in zip(unique_labels, counts):
             print(f"    {CLASS_NAMES.get(lbl, lbl):<12}: {cnt:6d} ({100*cnt/len(y_true):.1f}%)")
 
-        # ── Pre-compute reference frame (refdiff mode only) ───────────────────
-        reference_frame = None
+        # ── Pre-compute multi-reference frames (refdiff mode only) ────────────
+        reference_frames = None
         if use_refdiff:
             fps_val = FPS_MAP.get(
                 next((k for k in FPS_MAP if k in video_path), "Camera A"), 3.0
             )
-            print(f"  Computing reference frame from first 100 frames…")
-            reference_frame = compute_reference_frame(video_path, fps_val, n_frames=100)
-            print(f"  Reference frame shape: {reference_frame.shape}, "
-                  f"mean pixel: {reference_frame.mean():.3f}")
+            print(f"  Computing {args.num_refs} reference frames spread across Normal frames…")
+            reference_frames = compute_multi_reference_frames(
+                video_path, fps_val, gt_df,
+                n_refs=args.num_refs, n_frames_each=50,
+            )
 
         # ── Full sliding window inference ─────────────────────────────────────
         predictions, probabilities = evaluate_video_full_sweep(
@@ -591,7 +653,7 @@ def main():
             batch_size=args.batch_size,
             use_flow=use_flow,
             use_refdiff=use_refdiff,
-            reference_frame=reference_frame,
+            reference_frames=reference_frames,
         )
 
         # ── Temporal smoothing ───────────────────────────────────────────────

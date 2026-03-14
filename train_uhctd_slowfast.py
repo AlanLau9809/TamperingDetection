@@ -4,6 +4,7 @@ Training script for UHCTD Camera Tampering Detection using SlowFast.
 
 Key improvements over original:
   ● --config flag to select RGB-only (SLOWFAST_UHCTD_RGB.yaml) or flow (SLOWFAST_UHCTD.yaml)
+  ● --pretrained flag to load Places365-inflated weights into the Slow pathway
   ● 1:1:1:1 balanced class weights (no manual up-weighting needed; dataset is now balanced)
   ● Early stopping based on macro F1 (correct metric under class imbalance)
   ● Works with the updated uhctd_dataset.py that produces much more training data
@@ -118,11 +119,97 @@ def validate_dataset(cfg):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Places365 pretrained weight loader
+# ════════════════════════════════════════════════════════════════════════════
+
+def load_places365_pretrained(model, pretrained_path: str) -> None:
+    """
+    Load Places365-inflated weights into the SlowFast model.
+
+    This function loads the output of inflate_places365_to_slowfast.py
+    and applies it to the model with strict=False so that:
+      • Slow pathway weights are overwritten from Places365 (inflated).
+      • Fast pathway, fusion layers, and classification head stay as
+        random init (keys absent from the saved file → untouched).
+
+    The function prints a detailed summary of which keys were loaded,
+    which were unexpectedly missing, and which were ignored.
+
+    Args:
+        model:             The SlowFast model (already built, on CPU or GPU).
+        pretrained_path:   Path to the .pth file produced by the inflation script.
+    """
+    print(f"\n{'='*60}")
+    print("Loading Places365-inflated pretrained weights …")
+    print(f"  Source: {pretrained_path}")
+
+    if not os.path.exists(pretrained_path):
+        raise FileNotFoundError(
+            f"Pretrained checkpoint not found: {pretrained_path}\n"
+            "Run inflate_places365_to_slowfast.py first."
+        )
+
+    ckpt = torch.load(pretrained_path, map_location='cpu', weights_only=False)
+
+    # The inflation script saves {'model_state_dict': …, 'inflation_stats': …}
+    if 'model_state_dict' in ckpt:
+        state_dict = ckpt['model_state_dict']
+        inf_stats  = ckpt.get('inflation_stats', {})
+        print(f"  Inflation stats  : "
+              f"matched={inf_stats.get('n_matched', '?')}, "
+              f"skipped={inf_stats.get('n_skipped', '?')}, "
+              f"inflated={inf_stats.get('n_inflated', '?')}, "
+              f"padded={inf_stats.get('n_padded', '?')}")
+    else:
+        # Fallback: raw state_dict
+        state_dict = ckpt
+
+    current_sd = model.state_dict()
+
+    # Use strict=False so missing/unexpected keys are logged, not fatal.
+    msg = model.load_state_dict(state_dict, strict=False)
+
+    # ── Report result ─────────────────────────────────────────────────────────
+    missing  = msg.missing_keys    # keys in model but NOT in state_dict
+    unexpect = msg.unexpected_keys # keys in state_dict but NOT in model
+
+    # Keys that genuinely came from Places365 Slow pathway
+    slow_loaded  = [k for k in state_dict.keys() if 'pathway0' in k and k in current_sd]
+    # Keys that were intentionally NOT loaded (Fast pathway / head / fusion)
+    not_loaded   = [k for k in state_dict.keys()
+                    if ('pathway1' in k or 'head.' in k or '_fuse.' in k)]
+
+    print(f"\n  Slow pathway keys loaded     : {len(slow_loaded)}")
+    print(f"  Missing keys (random init)   : {len(missing)}")
+    if missing[:5]:
+        for k in missing[:5]:
+            print(f"    - {k}")
+        if len(missing) > 5:
+            print(f"    … and {len(missing)-5} more")
+
+    if unexpect:
+        print(f"  Unexpected keys (ignored)    : {len(unexpect)}")
+        for k in unexpect[:3]:
+            print(f"    ! {k}")
+
+    print(f"\n  Initialisation strategy:")
+    print(f"    • Slow pathway (pathway0)  : Places365 ✓  ({len(slow_loaded)} keys)")
+    fast_rnd  = sum(1 for k in current_sd if 'pathway1' in k)
+    fuse_rnd  = sum(1 for k in current_sd if '_fuse.'   in k)
+    head_rnd  = sum(1 for k in current_sd if 'head.'    in k)
+    print(f"    • Fast pathway (pathway1)  : Random init  ({fast_rnd} keys)")
+    print(f"    • Fusion layers            : Random init  ({fuse_rnd} keys)")
+    print(f"    • Classification head      : Random init  ({head_rnd} keys)")
+    print(f"{'='*60}\n")
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # Training loop
 # ════════════════════════════════════════════════════════════════════════════
 
 def train_model(cfg, max_epochs=20, early_stop_patience=5,
-                experiment="E1", model_tag="SlowFast_R50_RGB"):
+                experiment="E1", model_tag="SlowFast_R50_RGB",
+                pretrained_path=None):
     exp_info = EXPERIMENTS[experiment]
     checkpoint_name = f"{experiment}_{model_tag}_best.pth"
     checkpoint_path = os.path.join(cfg.OUTPUT_DIR, checkpoint_name)
@@ -136,6 +223,13 @@ def train_model(cfg, max_epochs=20, early_stop_patience=5,
 
     # ── Model ────────────────────────────────────────────────────────────────
     model = build_model(cfg)
+
+    # ── Places365 pretrained weights (Slow pathway only) ─────────────────────
+    if pretrained_path:
+        print(f"  Pretrained  : {pretrained_path}")
+        load_places365_pretrained(model, pretrained_path)
+    else:
+        print("  Pretrained  : None (training from random init)")
 
     # ── Optimizer (SGD with Nesterov momentum) ───────────────────────────────
     optimizer = torch.optim.SGD(
@@ -351,6 +445,14 @@ def main():
                         help="Max training epochs (default: 20)")
     parser.add_argument("--patience", type=int, default=5,
                         help="Early stopping patience on val macro F1 (default: 5)")
+    parser.add_argument(
+        "--pretrained", type=str, default=None,
+        help="Path to Places365-inflated SlowFast checkpoint produced by "
+             "inflate_places365_to_slowfast.py. "
+             "When provided, the Slow pathway is warm-started from Places365 "
+             "scene-geometry priors; Fast pathway + head remain at random init. "
+             "Example: SlowFast-main/checkpoint/places365_slowfast_slow_pathway.pth"
+    )
     args = parser.parse_args()
 
     exp_info = EXPERIMENTS[args.experiment]
@@ -361,6 +463,7 @@ def main():
     print(f"Model tag   : {args.model}")
     print(f"Config      : {args.config}")
     print(f"Epochs      : {args.epochs}  |  Patience: {args.patience}")
+    print(f"Pretrained  : {args.pretrained or 'None (random init)'}")
     print(f"Checkpoint  : {args.experiment}_{args.model}_best.pth")
     print("=" * 60)
 
@@ -383,6 +486,7 @@ def main():
         early_stop_patience=args.patience,
         experiment=args.experiment,
         model_tag=args.model,
+        pretrained_path=args.pretrained,
     )
 
 

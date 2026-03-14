@@ -1,0 +1,148 @@
+# ============================================================================
+# SLOWFAST_UHCTD_Places365.yaml
+# SlowFast R50 — UHCTD Camera Tampering Detection
+# Slow Pathway initialised from Places365-inflated weights
+# ============================================================================
+#
+# Methodology:
+#   This config is used in conjunction with inflate_places365_to_slowfast.py,
+#   which converts the 2D Places365 ResNet50 checkpoint into a 3D SlowFast
+#   checkpoint using weight inflation (Carreira & Zisserman, I3D, CVPR 2017).
+#
+#   The original UHCTD paper (Yohanandan et al.) used Places365-pretrained
+#   ResNet50 to provide spatial scene-geometry priors for tampering detection.
+#   This config extends that approach to a 3D temporal architecture:
+#
+#     Slow pathway (RGB) ← Places365 inflated weights
+#         • Captures "what a normal surveillance scene looks like"
+#         • Particularly benefits detection of 'Moved' events (scene changes)
+#
+#     Fast pathway (RGB) ← Random initialisation
+#         • Processes high-frame-rate temporal signal
+#         • Must learn short-term motion anomalies from scratch
+#
+#     Fusion layers + Classification head ← Random initialisation
+#         • Fusion: no Places365 analogue exists
+#         • Head: 4 tampering classes ≠ 365 scene classes
+#
+# Usage:
+#   Step 1 — Inflate weights:
+#     cd TamperingDetection
+#     python inflate_places365_to_slowfast.py \
+#         --places365 ../Backup/UHCTD_Pretrained/resnet50_places365.pth.tar \
+#         --config SlowFast-main/configs/UHCTD/SLOWFAST_UHCTD_Places365.yaml \
+#         --output SlowFast-main/checkpoint/places365_slowfast_slow_pathway.pth
+#
+#   Step 2 — Train:
+#     python train_uhctd_slowfast.py \
+#         --experiment E1 \
+#         --model SlowFast_R50_Places365 \
+#         --config SlowFast-main/configs/UHCTD/SLOWFAST_UHCTD_Places365.yaml \
+#         --pretrained SlowFast-main/checkpoint/places365_slowfast_slow_pathway.pth \
+#         --epochs 20 \
+#         --patience 5
+#
+#   Step 3 — Evaluate:
+#     python evaluate_uhctd_model.py \
+#         --experiment E1 \
+#         --model SlowFast_R50_Places365 \
+#         --config SlowFast-main/configs/UHCTD/SLOWFAST_UHCTD_Places365.yaml
+# ============================================================================
+
+TRAIN:
+  ENABLE: True
+  DATASET: uhctd
+  BATCH_SIZE: 4            # Same as RGB baseline for fair comparison
+  EVAL_PERIOD: 10
+  CHECKPOINT_PERIOD: 1
+  AUTO_RESUME: True
+  # NOTE: CHECKPOINT_FILE_PATH is intentionally left empty here.
+  # The Places365 inflated weights are loaded manually by train_uhctd_slowfast.py
+  # via the --pretrained flag, giving us fine-grained control over which layers
+  # are loaded (Slow pathway only) and with strict=False handling.
+  CHECKPOINT_FILE_PATH: ""
+
+DATA:
+  PATH_TO_DATA_DIR: "/mnt/d/FYP/UHCTD/UHCTD Comprehensive Dataset For Camera Tampering Detection"
+  PATH_PREFIX: "/mnt/d/FYP/UHCTD/UHCTD Comprehensive Dataset For Camera Tampering Detection"
+  NUM_FRAMES: 32
+  SAMPLING_RATE: 2         # Sample every 2nd frame → 64-frame temporal window
+  TRAIN_JITTER_SCALES: [256, 320]
+  TRAIN_CROP_SIZE: 224
+  TEST_CROP_SIZE: 224
+  # Both pathways use 3-channel RGB.
+  # The Slow pathway receives Places365-initialised weights;
+  # the Fast pathway uses standard random init.
+  INPUT_CHANNEL_NUM: [3, 3]
+  # ImageNet-compatible normalisation (matches Places365 ResNet50 training)
+  # Places365 models are trained with standard ImageNet stats
+  MEAN: [0.485, 0.456, 0.406]
+  STD:  [0.229, 0.224, 0.225]
+  RANDOM_FLIP: True
+  DECODING_BACKEND: pyav
+
+SLOWFAST:
+  ALPHA: 4               # Fast pathway runs at 4× frame rate of Slow
+  BETA_INV: 8            # Fast pathway has 1/8 channels of Slow
+  FUSION_CONV_CHANNEL_RATIO: 2
+  FUSION_KERNEL_SZ: 7
+
+RESNET:
+  ZERO_INIT_FINAL_BN: True
+  WIDTH_PER_GROUP: 64
+  NUM_GROUPS: 1
+  DEPTH: 50
+  TRANS_FUNC: bottleneck_transform
+  STRIDE_1X1: False
+  NUM_BLOCK_TEMP_KERNEL: [[3, 3], [4, 4], [6, 6], [3, 3]]
+  SPATIAL_STRIDES: [[1, 1], [2, 2], [2, 2], [2, 2]]
+  SPATIAL_DILATIONS: [[1, 1], [1, 1], [1, 1], [1, 1]]
+
+NONLOCAL:
+  LOCATION: [[[], []], [[], []], [[], []], [[], []]]
+  GROUP: [[1, 1], [1, 1], [1, 1], [1, 1]]
+  INSTANTIATION: dot_product
+
+BN:
+  USE_PRECISE_STATS: True
+  NUM_BATCHES_PRECISE: 200
+
+SOLVER:
+  # Fine-tuning from pretrained weights uses a LOWER learning rate than
+  # training from scratch, to avoid destroying the Places365 features.
+  # RGB baseline uses 0.01; here we use 0.005 (half) for safer fine-tuning.
+  BASE_LR: 0.005
+  LR_POLICY: cosine
+  MAX_EPOCH: 30
+  MOMENTUM: 0.9
+  WEIGHT_DECAY: 1e-4
+  # Longer warmup (5 epochs vs 3) to gently ramp up LR and protect the
+  # Places365 pretrained weights from being corrupted in early epochs.
+  WARMUP_EPOCHS: 5.0
+  WARMUP_START_LR: 0.0005
+  OPTIMIZING_METHOD: sgd
+
+MODEL:
+  NUM_CLASSES: 4          # Normal (0), Covered (1), Defocused (2), Moved (3)
+  ARCH: slowfast
+  MODEL_NAME: SlowFast
+  LOSS_FUNC: cross_entropy
+  DROPOUT_RATE: 0.5       # Same as RGB baseline
+
+TEST:
+  ENABLE: True
+  DATASET: uhctd
+  BATCH_SIZE: 4
+
+DATA_LOADER:
+  ENABLE_MULTI_THREAD_DECODE: True
+  NUM_WORKERS: 4
+  PIN_MEMORY: True
+
+NUM_GPUS: 1
+NUM_SHARDS: 1
+RNG_SEED: 42
+OUTPUT_DIR: "/mnt/d/FYP/TamperingDetection/SlowFast-main/checkpoint"
+
+AVA:
+  BGR: False

@@ -2,15 +2,20 @@
 """
 UHCTD Dataset loader for SlowFast.
 
-Supports two modes (auto-detected from cfg.DATA.INPUT_CHANNEL_NUM[1]):
-  - RGB-only (channel=3): Slow=RGB(3ch, T/α frames), Fast=RGB(3ch, T frames)   [recommended]
-  - RGB+Flow (channel=2): Slow=RGB(3ch, T/α frames), Fast=Flow(2ch, T frames)  [legacy]
+Supports three modes (selected via UHCTD_FAST_MODE environment variable):
+  - 'rgb'     : Slow=RGB(3ch, T/α frames), Fast=RGB(3ch, T frames)    [default]
+  - 'refdiff' : Slow=RGB(3ch, T/α frames), Fast=|frame-ref|(3ch, T)   [recommended]
+  - 'flow'    : Slow=RGB(3ch, T/α frames), Fast=Flow(2ch, T frames)   [legacy]
 
-Key fixes over original:
+'refdiff' mode computes |Frame_t − Reference_Frame| for every fast-pathway frame,
+where the reference frame is the mean of the first ~100 Normal frames of each video.
+This gives the fast pathway a persistent spatial-change signal that easily distinguishes
+Moved/Covered/Defocused even when the tampering is fully settled (zero optical flow).
+
+Key design:
   1. Clip cap raised to 500 per type (was 50) → much larger training set
   2. Normal class balanced 1:1:1:1 with tampering classes
-  3. Optical flow path only activated when INPUT_CHANNEL_NUM[1]==2; default is RGB-only
-  4. Preprocessing computes flow on small 224px frames (same as eval) when flow mode active
+  3. Reference frames pre-computed once at dataset construction, cached by video_path
 """
 
 import os
@@ -65,13 +70,27 @@ class Uhctd(torch.utils.data.Dataset):
         self._num_classes  = cfg.MODEL.NUM_CLASSES
 
         # ── Mode detection ───────────────────────────────────────────────────
-        # INPUT_CHANNEL_NUM = [slow_ch, fast_ch]
-        #   fast_ch == 3 → RGB-only (both pathways get RGB)
-        #   fast_ch == 2 → flow mode (fast pathway gets optical flow)
-        fast_ch = cfg.DATA.INPUT_CHANNEL_NUM[1] if len(cfg.DATA.INPUT_CHANNEL_NUM) > 1 else 3
-        self._use_flow = (fast_ch == 2)
-        logger.info(f"UHCTD mode: {'RGB+Flow' if self._use_flow else 'RGB-only'} "
-                    f"(INPUT_CHANNEL_NUM[1]={fast_ch})")
+        # Priority: UHCTD_FAST_MODE env var overrides INPUT_CHANNEL_NUM detection.
+        #   'rgb'     → both pathways get RGB (INPUT_CHANNEL_NUM=[3,3])
+        #   'refdiff' → fast pathway gets |frame_t - reference| (INPUT_CHANNEL_NUM=[3,3])
+        #   'flow'    → fast pathway gets optical flow (INPUT_CHANNEL_NUM=[3,2])
+        env_mode = os.environ.get('UHCTD_FAST_MODE', '').strip().lower()
+        fast_ch  = cfg.DATA.INPUT_CHANNEL_NUM[1] if len(cfg.DATA.INPUT_CHANNEL_NUM) > 1 else 3
+        if env_mode in ('rgb', 'refdiff', 'flow'):
+            self._fast_mode = env_mode
+        elif fast_ch == 2:
+            self._fast_mode = 'flow'
+        else:
+            self._fast_mode = 'rgb'
+
+        self._use_flow    = (self._fast_mode == 'flow')
+        self._use_refdiff = (self._fast_mode == 'refdiff')
+        logger.info(f"UHCTD fast_mode={self._fast_mode}  "
+                    f"(INPUT_CHANNEL_NUM[1]={fast_ch}, UHCTD_FAST_MODE='{env_mode}')")
+
+        # Reference frames cache: {video_path: float_tensor[3,H,W] in [0,1]}
+        # Populated during _construct_loader when refdiff mode is active.
+        self._reference_frames: dict = {}
 
         # ── Normalisation ────────────────────────────────────────────────────
         self._data_mean = cfg.DATA.MEAN
@@ -140,6 +159,11 @@ class Uhctd(torch.utils.data.Dataset):
                 col_names = ['frame', 'tamper', 'quantity', 'rate', 'status']
                 ann_df = pd.read_csv(ann_file, header=0, names=col_names)
                 self._process_annotations(video_file, ann_df)
+
+                # Pre-compute multi-reference frames for refdiff mode (list of [3,H,W] tensors)
+                if self._use_refdiff and video_file not in self._reference_frames:
+                    refs = self._compute_reference_frames(video_file, ann_df, n_refs=5, n_frames_each=50)
+                    self._reference_frames[video_file] = refs  # list of [3, H, W] tensors
 
         logger.info(f"Total clips constructed: {len(self._video_clips)}")
 
@@ -238,6 +262,61 @@ class Uhctd(torch.utils.data.Dataset):
         return segs
 
     # ════════════════════════════════════════════════════════════════════════
+    # Reference frame computation (refdiff mode)
+    # ════════════════════════════════════════════════════════════════════════
+
+    def _compute_reference_frames(self, video_path, ann_df, n_refs=5, n_frames_each=50):
+        """
+        Compute n_refs reference frames spread evenly across Normal frames in the video.
+
+        Each reference is the temporal mean of n_frames_each consecutive Normal frames
+        at that anchor position. Returns a list of float32 [3, H, W] tensors in [0,1].
+
+        Using multiple references that cover different times of day allows the model
+        to learn to recognise that "min(diff) near zero" = Normal, while
+        "min(diff) large" = tampered — even across full day/night lighting cycles.
+        Falls back to a single grey frame if loading fails entirely.
+        """
+        fps = self._fps_for_video(video_path)
+        vals = ann_df['tamper'].values
+        normal_indices = np.where(vals == 0)[0]
+
+        if len(normal_indices) == 0:
+            logger.warning(f"No Normal frames in {video_path}. Using grey reference.")
+            return [torch.full((3, 224, 224), 0.5, dtype=torch.float32)]
+
+        # Evenly spaced anchor positions within the Normal frames
+        anchor_positions = np.linspace(0, len(normal_indices) - 1, n_refs, dtype=int)
+        anchor_frames    = [int(normal_indices[p]) for p in anchor_positions]
+
+        refs = []
+        half = n_frames_each // 2
+        for anchor in anchor_frames:
+            start = max(0, anchor - half)
+            start_pts = float(start) / fps
+            end_pts   = float(start + n_frames_each) / fps
+            try:
+                v_frames, _, _ = io.read_video(
+                    video_path, start_pts=start_pts, end_pts=end_pts, pts_unit="sec"
+                )
+                if v_frames is None or v_frames.shape[0] == 0:
+                    continue
+                ref_hwc = v_frames.float().mean(dim=0) / 255.0   # [H, W, 3]
+                ref_chw = ref_hwc.permute(2, 0, 1)               # [3, H, W]
+                refs.append(ref_chw)
+            except Exception as e:
+                logger.warning(f"Reference load failed at frame {anchor} in {video_path}: {e}")
+                continue
+
+        if not refs:
+            logger.warning(f"All reference loads failed for {video_path}. Using grey.")
+            return [torch.full((3, 224, 224), 0.5, dtype=torch.float32)]
+
+        logger.info(f"Computed {len(refs)} reference frames at Normal frames "
+                    f"{anchor_frames[:len(refs)]} for {os.path.basename(os.path.dirname(video_path))}")
+        return refs  # list of [3, H, W] float32 tensors
+
+    # ════════════════════════════════════════════════════════════════════════
     # Frame loading
     # ════════════════════════════════════════════════════════════════════════
 
@@ -306,24 +385,19 @@ class Uhctd(torch.utils.data.Dataset):
                 flow_list.append(np.zeros((H, W, 2), dtype=np.float32))
         return torch.from_numpy(np.stack(flow_list)).float()  # [T-1, H, W, 2]
 
-    def _preprocess_frames(self, frames_thwc):
+    def _preprocess_frames(self, frames_thwc, reference_frame=None):
         """
         Full preprocessing pipeline.
 
-        RGB-only mode (INPUT_CHANNEL_NUM[1]==3)  [DEFAULT]:
-            1. float+resize → [T, C, 224, 224]
-            2. normalize RGB
-            3. Slow: subsample T/α frames from rgb
-            4. Fast: full T frames of rgb
-            → returns [slow_rgb[3,T/α,224,224], fast_rgb[3,T,224,224]]
+        'rgb' mode [default]:
+            Slow=RGB(3ch, T/α), Fast=RGB(3ch, T)
 
-        RGB+Flow mode (INPUT_CHANNEL_NUM[1]==2):
-            1. float+resize → [T, C, 224, 224]
-            2. compute flow on small frames → [T-1, H, W, 2]
-            3. normalize RGB; normalize flow
-            4. Slow: subsample T/α RGB frames
-            5. Fast: flow padded to T frames
-            → returns [slow_rgb[3,T/α,224,224], fast_flow[2,T,224,224]]
+        'refdiff' mode:
+            Slow=RGB(3ch, T/α), Fast=|frame_t − reference|(3ch, T)
+            reference_frame: float32 [3,H,W] in [0,1], un-normalized
+
+        'flow' mode:
+            Slow=RGB(3ch, T/α), Fast=Flow(2ch, T)
         """
         # ── Step 1: float & spatial sampling ────────────────────────────────
         frames_float = frames_thwc.float() / 255.0         # [T, H, W, C]
@@ -366,7 +440,60 @@ class Uhctd(torch.utils.data.Dataset):
         slow_idx = torch.linspace(0, T - 1, T // alpha, dtype=torch.long)
         slow_rgb = rgb_frames[:, slow_idx, :, :]  # [3, 8, H, W]
 
-        if not self._use_flow:
+        if self._use_refdiff:
+            # ── RefDiff: Fast pathway = |whiten(frame_t) − whiten(reference)| ──
+            # Per-frame luminance whitening removes global brightness drift
+            # (day/night lighting changes), making the diff purely structural.
+            # whiten(f) = f / mean_brightness(f)  →  brightness-invariant texture
+
+            def _whiten(t_thwc):
+                """Whiten [T, 3, H, W] float: divide each frame by its mean brightness."""
+                mu = t_thwc.mean(dim=[2, 3], keepdim=True).clamp(min=1e-6)
+                return t_thwc / mu   # [T, 3, H, W], values roughly in [0, ~3]
+
+            rgb_whitened = _whiten(rgb_small)  # [T, 3, H, W]
+
+            H, W = rgb_small.shape[2], rgb_small.shape[3]
+
+            # Support both:
+            #   single ref  → old single-tensor [3,H,W]  (backward compat)
+            #   multi ref   → new list of [3,H,W] tensors (n_refs=5)
+            if reference_frame is None:
+                ref_list = [rgb_small[0]]      # first frame of clip as fallback
+            elif isinstance(reference_frame, list):
+                ref_list = reference_frame     # list of [3, H, W] tensors
+            else:
+                ref_list = [reference_frame]   # single tensor → wrap in list
+
+            # Compute pixel-wise MINIMUM absolute diff across all references.
+            # For a Normal frame: at least one reference matches the lighting
+            # → min(diff) is near zero.
+            # For a tampered frame: ALL references are structurally different
+            # → min(diff) stays large.
+            diff_maps = []
+            for ref in ref_list:
+                if ref.shape[1] != H or ref.shape[2] != W:
+                    ref = torch.nn.functional.interpolate(
+                        ref.unsqueeze(0), size=(H, W), mode='bilinear', align_corners=False
+                    ).squeeze(0)
+                ref_exp = ref.unsqueeze(0)            # [1, 3, H, W]
+                ref_wh  = _whiten(ref_exp)            # [1, 3, H, W]
+                diff_maps.append(torch.abs(rgb_whitened - ref_wh))  # [T, 3, H, W]
+
+            if len(diff_maps) == 1:
+                diff_frames = diff_maps[0]                              # [T, 3, H, W]
+            else:
+                diff_frames = torch.stack(diff_maps, dim=0).min(dim=0).values  # [T, 3, H, W]
+
+            # [T, 3, H, W] → [3, T, H, W]
+            diff_frames = diff_frames.permute(1, 0, 2, 3)
+
+            # Normalize: whitened diff range is ~[0,2]; use same mean/std as RGB
+            diff_frames = (diff_frames - rgb_mean) / rgb_std
+
+            return [slow_rgb, diff_frames]  # [3,T/α,H,W], [3,T,H,W]
+
+        elif not self._use_flow:
             # ── RGB-only: Fast pathway = full T RGB frames ───────────────────
             return [slow_rgb, rgb_frames]   # [3,8,H,W], [3,32,H,W]
 
@@ -399,10 +526,12 @@ class Uhctd(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         video_path, start_frame, end_frame, label = self._video_clips[idx]
 
+        ref_frame = self._reference_frames.get(video_path, None) if self._use_refdiff else None
+
         for i_try in range(self._num_retries):
             try:
                 frames_thwc = self._load_frames(video_path, start_frame, end_frame)
-                pathway_frames = self._preprocess_frames(frames_thwc)
+                pathway_frames = self._preprocess_frames(frames_thwc, reference_frame=ref_frame)
 
                 label_arr = np.zeros(self._num_classes, dtype=np.int32)
                 label_arr[label] = 1
@@ -445,7 +574,7 @@ class Uhctd(torch.utils.data.Dataset):
     def _print_summary(self):
         logger.info("=== UHCTD dataset summary ===")
         logger.info(f"  Split          : {self.mode}")
-        logger.info(f"  Mode           : {'RGB+Flow' if self._use_flow else 'RGB-only'}")
+        logger.info(f"  Mode           : {self._fast_mode}")
         logger.info(f"  Total clips    : {len(self._video_clips)}")
         logger.info(f"  Frames/clip    : {self._video_length} (sampling_rate={self._sample_rate})")
 
