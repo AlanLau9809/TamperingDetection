@@ -7,14 +7,15 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support, con
 from sklearn.preprocessing import label_binarize
 from itertools import cycle
 
+
 def calculate_and_print_metrics(y_true, y_pred, class_names, description="Results"):
     """Calculates and prints classification metrics."""
     accuracy = accuracy_score(y_true, y_pred)
-    
+
     # Macro-average for overall P/R/F1, then per-class for detailed view
     precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='macro', zero_division=0)
     precision_per_class, recall_per_class, f1_per_class, _ = precision_recall_fscore_support(y_true, y_pred, average=None, zero_division=0)
-    
+
     cm = confusion_matrix(y_true, y_pred)
 
     print(f"\n{description} Metrics:")
@@ -22,14 +23,15 @@ def calculate_and_print_metrics(y_true, y_pred, class_names, description="Result
     print(f"   Macro Precision: {precision:.3f}, Macro Recall: {recall:.3f}, Macro F1: {f1:.3f}")
 
     for i, name in class_names.items():
-        if i < len(precision_per_class): # Ensure index is within bounds
+        if i < len(precision_per_class):  # Ensure index is within bounds
             print(f"   {name} ({i}): P={precision_per_class[i]:.3f}, R={recall_per_class[i]:.3f}, F1={f1_per_class[i]:.3f}")
-    
+
     print(f"   Confusion Matrix (True \u2193 | Predicted \u2192 ):")
     print(cm)
     print(f"   Classes: {[f'{k}={v}' for k,v in class_names.items()]}")
-    
+
     return accuracy, precision, recall, f1, cm, precision_per_class, recall_per_class, f1_per_class
+
 
 def plot_confusion_matrix(cm, class_names, title, save_path):
     """Plots a confusion matrix as a heatmap."""
@@ -43,10 +45,12 @@ def plot_confusion_matrix(cm, class_names, title, save_path):
     plt.savefig(save_path)
     plt.close()
 
+
 def plot_per_class_metrics(precision_per_class, recall_per_class, f1_per_class, class_names, title, save_path):
     """Plots per-class precision, recall, and F1-score as bar charts."""
     num_classes = len(class_names)
-    if num_classes == 0: return # Handle empty class_names
+    if num_classes == 0:
+        return  # Handle empty class_names
 
     metrics_df = pd.DataFrame({
         'Class': list(class_names.values()),
@@ -62,20 +66,22 @@ def plot_per_class_metrics(precision_per_class, recall_per_class, f1_per_class, 
     plt.title(title)
     plt.ylabel('Score')
     plt.xlabel('Class')
-    plt.ylim(0, 1) # Metrics are between 0 and 1
+    plt.ylim(0, 1)  # Metrics are between 0 and 1
     plt.legend(title='Metric', loc='lower right')
     plt.tight_layout()
     plt.savefig(save_path)
     plt.close()
 
+
 def plot_roc_curve(y_true, y_score, class_names, title, save_path):
     """Plots multi-class ROC curves."""
     n_classes = len(class_names)
-    if n_classes == 0: return # Handle empty class_names
+    if n_classes == 0:
+        return  # Handle empty class_names
 
     # Binarize the true labels
     y_true_bin = label_binarize(y_true, classes=list(class_names.keys()))
-    if n_classes == 1: # Handle binary case if passed as multi-class
+    if n_classes == 1:  # Handle binary case if passed as multi-class
         y_true_bin = np.array([1 if x == list(class_names.keys())[0] else 0 for x in y_true]).reshape(-1, 1)
 
     # Compute ROC curve and ROC area for each class
@@ -93,7 +99,7 @@ def plot_roc_curve(y_true, y_score, class_names, title, save_path):
         plt.plot(fpr[i], tpr[i], color=color, lw=2,
                  label=f'ROC curve of class {class_names[i]} (area = {roc_auc[i]:.2f})')
 
-    plt.plot([0, 1], [0, 1], 'k--', lw=2) # Random classifier line
+    plt.plot([0, 1], [0, 1], 'k--', lw=2)  # Random classifier line
     plt.xlim([0.0, 1.0])
     plt.ylim([0.0, 1.05])
     plt.xlabel('False Positive Rate')
@@ -105,14 +111,16 @@ def plot_roc_curve(y_true, y_score, class_names, title, save_path):
     plt.savefig(save_path)
     plt.close()
 
+
 def plot_precision_recall_curve(y_true, y_score, class_names, title, save_path):
     """Plots multi-class Precision-Recall curves."""
     n_classes = len(class_names)
-    if n_classes == 0: return # Handle empty class_names
+    if n_classes == 0:
+        return  # Handle empty class_names
 
     # Binarize the true labels
     y_true_bin = label_binarize(y_true, classes=list(class_names.keys()))
-    if n_classes == 1: # Handle binary case if passed as multi-class
+    if n_classes == 1:  # Handle binary case if passed as multi-class
         y_true_bin = np.array([1 if x == list(class_names.keys())[0] else 0 for x in y_true]).reshape(-1, 1)
 
     # Compute Precision-Recall curve and area for each class
@@ -141,60 +149,54 @@ def plot_precision_recall_curve(y_true, y_score, class_names, title, save_path):
     plt.savefig(save_path)
     plt.close()
 
-def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="Post-Evaluation Analysis")
-    parser.add_argument("--results_dir", type=str, default=None,
-                        help="Path to experiment results folder, e.g. 'Evaluation Results/E1_SlowFast_R50'. "
-                             "If omitted, scans top-level 'Evaluation Results/' for legacy CSV files.")
-    args = parser.parse_args()
 
-    print("Post-Evaluation Analysis Script")
-    print("================================")
-
-    if args.results_dir:
-        results_dir = args.results_dir
-    else:
-        results_dir = "./Evaluation Results"
-
-    output_plots_dir = os.path.join(results_dir, "Analysis Plots")
+def process_folder(folder_path, class_names):
+    """
+    Process all evaluation CSV files in a given folder.
+    Plots are saved to an 'Analysis Plots' subdirectory inside folder_path.
+    Returns a list of per-file metric dicts.
+    """
+    output_plots_dir = os.path.join(folder_path, "Analysis Plots")
     os.makedirs(output_plots_dir, exist_ok=True)
 
-    print(f"Results directory : {results_dir}")
-    print(f"Plots directory   : {output_plots_dir}")
+    folder_label = os.path.basename(folder_path)
+    print(f"\n{'='*60}")
+    print(f"Processing folder: {folder_label}")
+    print(f"  Plots will be saved to: {output_plots_dir}")
+    print(f"{'='*60}")
 
-    # Assuming 4-class for current context
-    class_names = {0: "Normal", 1: "Covered", 2: "Defocused", 3: "Moved"}
-
-    all_day_metrics = [] # To store metrics for overall summary
-
-    # Find all CSV files in the given directory (supports both naming conventions)
-    csv_files = [f for f in os.listdir(results_dir)
+    # Find CSV files: supports both eval_*.csv and evaluation_results_*.csv naming
+    csv_files = [f for f in os.listdir(folder_path)
                  if (f.startswith("eval_") or f.startswith("evaluation_results_")) and f.endswith(".csv")]
 
     if not csv_files:
-        print(f"No CSV files found in '{results_dir}'. Please ensure evaluation has been run.")
-        return
+        print(f"  No CSV files found in '{folder_path}'. Skipping.")
+        return []
 
-    print(f"Found {len(csv_files)} evaluation result files in '{results_dir}'.")
+    print(f"  Found {len(csv_files)} CSV file(s).")
 
-    for csv_file in sorted(csv_files): # Process in sorted order (e.g., Day 3, Day 4...)
-        file_path = os.path.join(results_dir, csv_file)
-        print(f"\nProcessing file: {csv_file}")
-        
+    all_file_metrics = []
+
+    for csv_file in sorted(csv_files):
+        file_path = os.path.join(folder_path, csv_file)
+        print(f"\n  Processing: {csv_file}")
+
         try:
             df = pd.read_csv(file_path)
             y_true = df['true_label'].values
             y_pred_smoothed = df['smoothed_prediction'].values
 
             # Print metrics
-            accuracy, precision, recall, f1, cm, precision_per_class, recall_per_class, f1_per_class = calculate_and_print_metrics(
-                y_true, y_pred_smoothed, class_names, description=f"Metrics for {csv_file} (Smoothed)"
-            )
-            
+            accuracy, precision, recall, f1, cm, precision_per_class, recall_per_class, f1_per_class = \
+                calculate_and_print_metrics(
+                    y_true, y_pred_smoothed, class_names,
+                    description=f"{folder_label}/{csv_file} (Smoothed)"
+                )
+
             # Store for overall summary
-            all_day_metrics.append({
+            all_file_metrics.append({
                 'file': csv_file,
+                'folder': folder_label,
                 'accuracy': accuracy,
                 'precision': precision,
                 'recall': recall,
@@ -205,78 +207,210 @@ def main():
             prob_cols = [col for col in df.columns if col.endswith('_prob')]
             y_score = df[prob_cols].values
 
+            base_name = os.path.splitext(csv_file)[0]
+
             # Plot Confusion Matrix
             plot_confusion_matrix(
-                cm, class_names, 
-                title=f"Confusion Matrix for {csv_file} (Smoothed)",
-                save_path=os.path.join(output_plots_dir, f"{os.path.splitext(csv_file)[0]}_cm.png")
+                cm, class_names,
+                title=f"Confusion Matrix\n{folder_label} | {csv_file} (Smoothed)",
+                save_path=os.path.join(output_plots_dir, f"{base_name}_cm.png")
             )
-            print(f"  Confusion Matrix plot saved to {output_plots_dir}")
+            print(f"    [OK] Confusion Matrix saved.")
 
             # Plot Per-Class Metrics
             plot_per_class_metrics(
                 precision_per_class, recall_per_class, f1_per_class, class_names,
-                title=f"Per-Class Metrics for {csv_file} (Smoothed)",
-                save_path=os.path.join(output_plots_dir, f"{os.path.splitext(csv_file)[0]}_per_class_metrics.png")
+                title=f"Per-Class Metrics\n{folder_label} | {csv_file} (Smoothed)",
+                save_path=os.path.join(output_plots_dir, f"{base_name}_per_class_metrics.png")
             )
-            print(f"  Per-Class Metrics plot saved to {output_plots_dir}")
+            print(f"    [OK] Per-Class Metrics saved.")
 
             # Plot ROC Curve
             plot_roc_curve(
                 y_true, y_score, class_names,
-                title=f"ROC Curve for {csv_file} (Smoothed)",
-                save_path=os.path.join(output_plots_dir, f"{os.path.splitext(csv_file)[0]}_roc_curve.png")
+                title=f"ROC Curve\n{folder_label} | {csv_file} (Smoothed)",
+                save_path=os.path.join(output_plots_dir, f"{base_name}_roc_curve.png")
             )
-            print(f"  ROC Curve plot saved to {output_plots_dir}")
+            print(f"    [OK] ROC Curve saved.")
 
             # Plot Precision-Recall Curve
             plot_precision_recall_curve(
                 y_true, y_score, class_names,
-                title=f"Precision-Recall Curve for {csv_file} (Smoothed)",
-                save_path=os.path.join(output_plots_dir, f"{os.path.splitext(csv_file)[0]}_pr_curve.png")
+                title=f"Precision-Recall Curve\n{folder_label} | {csv_file} (Smoothed)",
+                save_path=os.path.join(output_plots_dir, f"{base_name}_pr_curve.png")
             )
-            print(f"  Precision-Recall Curve plot saved to {output_plots_dir}")
+            print(f"    [OK] Precision-Recall Curve saved.")
 
         except Exception as e:
-            print(f"Error processing {csv_file}: {e}")
+            print(f"    [ERROR] processing {csv_file}: {e}")
             import traceback
             traceback.print_exc()
 
-    # Overall Summary
-    print("\n\n================================")
-    print("OVERALL METRICS SUMMARY ACROSS DAYS")
-    print("================================")
-    for metrics in all_day_metrics:
-        print(f"File: {metrics['file']}")
-        print(f"  Accuracy: {metrics['accuracy']:.3f}, P: {metrics['precision']:.3f}, R: {metrics['recall']:.3f}, F1: {metrics['f1']:.3f}")
-    
-    # Optional: Plot overall trends if needed (extract day number from filename)
-    if len(all_day_metrics) > 1:
-        metrics_df = pd.DataFrame(all_day_metrics)
+    # ---- Per-folder summary across days ----
+    if len(all_file_metrics) > 1:
         import re
+        metrics_df = pd.DataFrame(all_file_metrics)
+
         def extract_day(filename):
-            m = re.search(r'Day[_ ](\d+)', filename)
+            m = re.search(r'Day[_ ]?(\d+)', filename)
             return int(m.group(1)) if m else 0
+
         metrics_df['Day'] = metrics_df['file'].apply(extract_day)
         metrics_df = metrics_df.sort_values('Day')
 
         plt.figure(figsize=(10, 6))
         for metric in ['accuracy', 'precision', 'recall', 'f1']:
-            plt.plot(metrics_df['Day'], metrics_df[metric], marker='o', label=metric.replace('_', ' ').title())
-        exp_label = os.path.basename(results_dir)
-        plt.title(f'Performance Metrics Across Evaluation Days — {exp_label}')
+            plt.plot(metrics_df['Day'], metrics_df[metric], marker='o',
+                     label=metric.replace('_', ' ').title())
+        plt.title(f'Performance Across Evaluation Days — {folder_label}')
         plt.xlabel('Day')
         plt.ylabel('Score')
         plt.xticks(metrics_df['Day'])
         plt.legend()
         plt.grid(True)
         plt.tight_layout()
-        summary_plot_path = os.path.join(output_plots_dir, "overall_performance_across_days.png")
-        plt.savefig(summary_plot_path)
+        summary_path = os.path.join(output_plots_dir, "overall_performance_across_days.png")
+        plt.savefig(summary_path)
         plt.close()
-        print(f"Overall performance plot saved to {summary_plot_path}")
+        print(f"\n  [OK] Cross-day performance plot saved: {summary_path}")
 
-    print("\nAnalysis complete. Check 'Analysis Plots' folder for visualizations.")
+    # Print folder summary
+    print(f"\n  Summary for '{folder_label}':")
+    for m in all_file_metrics:
+        print(f"    {m['file']}: Acc={m['accuracy']:.3f}, P={m['precision']:.3f}, "
+              f"R={m['recall']:.3f}, F1={m['f1']:.3f}")
+
+    return all_file_metrics
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Post-Evaluation Analysis")
+    parser.add_argument("--results_dir", type=str, default=None,
+                        help="Path to a specific experiment results folder, "
+                             "e.g. 'TamperingDetection/Evaluation Results/E1_SlowFast_R50_Gray'. "
+                             "If omitted, ALL model sub-folders under the default "
+                             "'Evaluation Results/' directory are processed.")
+    parser.add_argument("--base_dir", type=str,
+                        default="Evaluation Results",
+                        help="Base directory that contains all model result sub-folders. "
+                             "Only used when --results_dir is not supplied.")
+    args = parser.parse_args()
+
+    print("Post-Evaluation Analysis Script")
+    print("================================")
+
+    # 4-class for UHCTD
+    class_names = {0: "Normal", 1: "Covered", 2: "Defocused", 3: "Moved"}
+
+    # ----------- SINGLE FOLDER MODE -----------
+    if args.results_dir:
+        folder = args.results_dir
+        if not os.path.isdir(folder):
+            print(f"[ERROR] '{folder}' is not a valid directory.")
+            return
+        process_folder(folder, class_names)
+        print("\nDone. Check the 'Analysis Plots' subfolder inside the specified directory.")
+        return
+
+    # ----------- MULTI-FOLDER (SCAN ALL) MODE -----------
+    base_dir = args.base_dir
+    if not os.path.isdir(base_dir):
+        print(f"[ERROR] Base directory '{base_dir}' does not exist.")
+        return
+
+    print(f"Base directory  : {base_dir}")
+    print("Scanning for model sub-folders and legacy top-level CSV files...\n")
+
+    # Collect folders to process
+    folders_to_process = []
+
+    # 1. Check for legacy top-level CSV files
+    legacy_csvs = [f for f in os.listdir(base_dir)
+                   if (f.startswith("eval_") or f.startswith("evaluation_results_")) and f.endswith(".csv")]
+    if legacy_csvs:
+        folders_to_process.append(base_dir)  # process the top-level dir itself
+
+    # 2. Find all model sub-folders that contain CSV files
+    for entry in sorted(os.listdir(base_dir)):
+        entry_path = os.path.join(base_dir, entry)
+        if not os.path.isdir(entry_path):
+            continue
+        # Skip the existing "Analysis Plots" folder and "Review Evaluation"
+        if entry in ("Analysis Plots", "Review Evaluation"):
+            continue
+        # Check if this sub-folder has any CSV files
+        sub_csvs = [f for f in os.listdir(entry_path)
+                    if (f.startswith("eval_") or f.startswith("evaluation_results_")) and f.endswith(".csv")]
+        if sub_csvs:
+            folders_to_process.append(entry_path)
+
+    if not folders_to_process:
+        print(f"No evaluation CSV files found under '{base_dir}'. "
+              f"Please ensure evaluation has been run.")
+        return
+
+    print(f"Found {len(folders_to_process)} folder(s) to process:")
+    for fp in folders_to_process:
+        print(f"  {fp}")
+
+    # Process each folder
+    all_model_metrics = {}
+    for folder_path in folders_to_process:
+        model_label = os.path.basename(folder_path)
+        metrics = process_folder(folder_path, class_names)
+        if metrics:
+            all_model_metrics[model_label] = metrics
+
+    # ---- Cross-model comparison summary ----
+    print("\n\n" + "="*60)
+    print("OVERALL SUMMARY ACROSS ALL MODELS")
+    print("="*60)
+
+    summary_rows = []
+    for model_label, metrics_list in all_model_metrics.items():
+        for m in metrics_list:
+            summary_rows.append({
+                'Model': model_label,
+                'File': m['file'],
+                'Accuracy': round(m['accuracy'], 3),
+                'Precision': round(m['precision'], 3),
+                'Recall': round(m['recall'], 3),
+                'F1': round(m['f1'], 3),
+            })
+            print(f"[{model_label}] {m['file']}: "
+                  f"Acc={m['accuracy']:.3f}, P={m['precision']:.3f}, "
+                  f"R={m['recall']:.3f}, F1={m['f1']:.3f}")
+
+    # Save summary CSV to base_dir
+    if summary_rows:
+        summary_df = pd.DataFrame(summary_rows)
+        summary_csv_path = os.path.join(base_dir, "all_models_summary.csv")
+        summary_df.to_csv(summary_csv_path, index=False)
+        print(f"\nSummary CSV saved to: {summary_csv_path}")
+
+        # Plot average F1 per model (mean across days)
+        avg_df = summary_df.groupby('Model')[['Accuracy', 'Precision', 'Recall', 'F1']].mean().reset_index()
+        avg_df = avg_df.sort_values('F1', ascending=False)
+
+        plt.figure(figsize=(max(12, len(avg_df) * 0.8), 6))
+        x = range(len(avg_df))
+        width = 0.2
+        for idx, metric in enumerate(['Accuracy', 'Precision', 'Recall', 'F1']):
+            plt.bar([xi + idx * width for xi in x], avg_df[metric], width=width, label=metric)
+        plt.xticks([xi + 1.5 * width for xi in x], avg_df['Model'], rotation=45, ha='right', fontsize=8)
+        plt.ylabel('Score')
+        plt.title('Average Performance per Model (Across Evaluation Days)')
+        plt.legend()
+        plt.ylim(0, 1)
+        plt.tight_layout()
+        comparison_path = os.path.join(base_dir, "model_comparison.png")
+        plt.savefig(comparison_path)
+        plt.close()
+        print(f"Model comparison chart saved to: {comparison_path}")
+
+    print("\nAnalysis complete. Check each model folder for 'Analysis Plots' sub-directories.")
+
 
 if __name__ == "__main__":
     main()

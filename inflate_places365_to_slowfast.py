@@ -7,7 +7,7 @@ checkpoint by inflating convolutional filters along the temporal dimension.
 
 Usage (run from TamperingDetection/):
     python inflate_places365_to_slowfast.py \
-        --places365 ../Backup/UHCTD_Pretrained/resnet50_places365.pth.tar \
+        --places365 ctd-devkit-master/models/UHCTD_Pretrained/resnet50_places365.pth.tar \
         --config SlowFast-main/configs/UHCTD/SLOWFAST_UHCTD_Places365.yaml \
         --output SlowFast-main/checkpoint/places365_slowfast_slow_pathway.pth
 
@@ -425,9 +425,9 @@ def main():
     )
     parser.add_argument(
         '--places365',
-        default='../Backup/UHCTD_Pretrained/resnet50_places365.pth.tar',
+        default='ctd-devkit-master/models/UHCTD_Pretrained/resnet50_places365.pth.tar',
         help='Path to resnet50_places365.pth.tar  '
-             '(default: ../Backup/UHCTD_Pretrained/resnet50_places365.pth.tar)',
+             '(default: ctd-devkit-master/models/UHCTD_Pretrained/resnet50_places365.pth.tar)',
     )
     parser.add_argument(
         '--config',

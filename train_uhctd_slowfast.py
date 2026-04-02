@@ -63,12 +63,15 @@ DEFAULT_CONFIG = "SlowFast-main/configs/UHCTD/SLOWFAST_UHCTD_RGB.yaml"
 def _set_fast_mode_from_config(config_path):
     """
     Inspect config filename and set UHCTD_FAST_MODE accordingly.
+      *GRAY*    → 'gray'
       *REFDIFF* → 'refdiff'
       *RGB*     → 'rgb'
       otherwise → leave unset (falls back to INPUT_CHANNEL_NUM detection)
     """
     upper = os.path.basename(config_path).upper()
-    if 'REFDIFF' in upper:
+    if 'GRAY' in upper:
+        os.environ['UHCTD_FAST_MODE'] = 'gray'
+    elif 'REFDIFF' in upper:
         os.environ['UHCTD_FAST_MODE'] = 'refdiff'
     elif 'RGB' in upper:
         os.environ['UHCTD_FAST_MODE'] = 'rgb'
@@ -166,8 +169,22 @@ def load_places365_pretrained(model, pretrained_path: str) -> None:
 
     current_sd = model.state_dict()
 
+    # Filter out keys with shape mismatches (e.g., fast pathway stem when changing
+    # from 3-channel RGB to 2-channel OptFlow). These keys were never important
+    # for the slow pathway (Places365 feature learning) anyway.
+    filtered_sd = {}
+    shape_mismatches = []
+    for k, v in state_dict.items():
+        if k in current_sd:
+            if v.shape == current_sd[k].shape:
+                filtered_sd[k] = v
+            else:
+                shape_mismatches.append((k, v.shape, current_sd[k].shape))
+        else:
+            filtered_sd[k] = v  # Key not in current model; will be ignored by strict=False
+
     # Use strict=False so missing/unexpected keys are logged, not fatal.
-    msg = model.load_state_dict(state_dict, strict=False)
+    msg = model.load_state_dict(filtered_sd, strict=False)
 
     # ── Report result ─────────────────────────────────────────────────────────
     missing  = msg.missing_keys    # keys in model but NOT in state_dict
@@ -178,6 +195,13 @@ def load_places365_pretrained(model, pretrained_path: str) -> None:
     # Keys that were intentionally NOT loaded (Fast pathway / head / fusion)
     not_loaded   = [k for k in state_dict.keys()
                     if ('pathway1' in k or 'head.' in k or '_fuse.' in k)]
+
+    if shape_mismatches:
+        print(f"  Shape mismatches (skipped)   : {len(shape_mismatches)}")
+        for k, old_shape, new_shape in shape_mismatches[:2]:
+            print(f"    - {k}: {old_shape} → {new_shape}")
+        if len(shape_mismatches) > 2:
+            print(f"    … and {len(shape_mismatches)-2} more")
 
     print(f"\n  Slow pathway keys loaded     : {len(slow_loaded)}")
     print(f"  Missing keys (random init)   : {len(missing)}")
@@ -475,10 +499,10 @@ def main():
         print("Dataset validation failed. Aborting.")
         return
 
-    answer = input("\nStart training? (y/n): ").strip().lower()
-    if answer not in ('y', 'yes'):
-        print("Training cancelled.")
-        return
+    # answer = input("\nStart training? (y/n): ").strip().lower()
+    # if answer not in ('y', 'yes'):
+    #     print("Training cancelled.")
+    #     return
 
     train_model(
         cfg,

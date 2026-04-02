@@ -585,8 +585,10 @@ def main():
     # Detect fast pathway mode (env var takes priority, then config filename, then channel count)
     env_mode = os.environ.get('UHCTD_FAST_MODE', '').strip().lower()
     fast_ch  = cfg.DATA.INPUT_CHANNEL_NUM[1] if len(cfg.DATA.INPUT_CHANNEL_NUM) > 1 else 3
-    if env_mode in ('rgb', 'refdiff', 'flow'):
+    if env_mode in ('rgb', 'refdiff', 'flow', 'gray'):
         fast_mode = env_mode
+    elif 'GRAY' in args.config.upper():
+        fast_mode = 'gray'
     elif 'REFDIFF' in args.config.upper():
         fast_mode = 'refdiff'
     elif fast_ch == 2:

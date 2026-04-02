@@ -85,6 +85,7 @@ class Uhctd(torch.utils.data.Dataset):
 
         self._use_flow    = (self._fast_mode == 'flow')
         self._use_refdiff = (self._fast_mode == 'refdiff')
+        self._use_gray    = (self._fast_mode == 'gray')
         logger.info(f"UHCTD fast_mode={self._fast_mode}  "
                     f"(INPUT_CHANNEL_NUM[1]={fast_ch}, UHCTD_FAST_MODE='{env_mode}')")
 
@@ -265,7 +266,7 @@ class Uhctd(torch.utils.data.Dataset):
     # Reference frame computation (refdiff mode)
     # ════════════════════════════════════════════════════════════════════════
 
-    def _compute_reference_frames(self, video_path, ann_df, n_refs=5, n_frames_each=50):
+    def _compute_reference_frames(self, video_path, ann_df, n_refs=10, n_frames_each=30):
         """
         Compute n_refs reference frames spread evenly across Normal frames in the video.
 
@@ -440,7 +441,18 @@ class Uhctd(torch.utils.data.Dataset):
         slow_idx = torch.linspace(0, T - 1, T // alpha, dtype=torch.long)
         slow_rgb = rgb_frames[:, slow_idx, :, :]  # [3, 8, H, W]
 
-        if self._use_refdiff:
+        if self._use_gray:
+            # ── Grayscale: Convert both pathways to luminance (3-ch replicated) ─
+            # Grayscale = 0.299*R + 0.587*G + 0.114*B, then replicate to 3 channels
+            def _to_gray_3ch(rgb_chw):  # [3, T, H, W]
+                gray = 0.299*rgb_chw[0] + 0.587*rgb_chw[1] + 0.114*rgb_chw[2]  # [T, H, W]
+                return gray.unsqueeze(0).expand(3, -1, -1, -1)  # [3, T, H, W]
+
+            slow_gray = _to_gray_3ch(slow_rgb)  # [3, T/alpha, H, W]
+            fast_gray = _to_gray_3ch(rgb_frames)  # [3, T, H, W]
+            return [slow_gray, fast_gray]  # both grayscale, 3-ch replicated
+
+        elif self._use_refdiff:
             # ── RefDiff: Fast pathway = |whiten(frame_t) − whiten(reference)| ──
             # Per-frame luminance whitening removes global brightness drift
             # (day/night lighting changes), making the diff purely structural.
