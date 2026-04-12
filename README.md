@@ -94,7 +94,7 @@ Input: 32-frame video clip (224×224×3)
 
 ```bash
 # Clone repository
-git clone <your-repo>
+git clone https://github.com/AlanLau9809/TamperingDetection.git
 cd TamperingDetection
 
 # Create virtual environment (recommended)

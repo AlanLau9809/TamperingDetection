@@ -502,12 +502,12 @@ def main():
 
     size_mb = os.path.getsize(output_path) / (1024 ** 2)
     print(f"  Saved: {output_path}  ({size_mb:.1f} MB)")
-    print(f"\n  Next step: train with")
-    print(f"    python train_uhctd_slowfast.py \\")
-    print(f"        --experiment E1 \\")
-    print(f"        --model SlowFast_R50_Places365 \\")
-    print(f"        --config SlowFast-main/configs/UHCTD/SLOWFAST_UHCTD_Places365.yaml \\")
-    print(f"        --pretrained SlowFast-main/checkpoint/places365_slowfast_slow_pathway.pth")
+    # print(f"\n  Next step: train with")
+    # print(f"    python train_uhctd_slowfast.py \\")
+    # print(f"        --experiment E1 \\")
+    # print(f"        --model SlowFast_R50_Places365 \\")
+    # print(f"        --config SlowFast-main/configs/UHCTD/SLOWFAST_UHCTD_Places365.yaml \\")
+    # print(f"        --pretrained SlowFast-main/checkpoint/places365_slowfast_slow_pathway.pth")
     print(f"{'='*60}\n")
     return 0
 

@@ -122,7 +122,7 @@ def _empty_metrics(labels):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Metrics — 2-class binary (Normal vs Tampered), per original paper
+# Metrics — 2-class binary (Normal vs Tampered)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_binary_metrics(y_true, y_pred, fps=FPS_CAM_A, exclude_moved=False):
@@ -478,11 +478,11 @@ def print_ranking(all_scores):
             row = f"  {model_tag:<{cw}}"
             for cls_id in range(4):
                 if is_e2 and cls_id in (0, 3):
-                    row += f"  {'--':>6} {'--':>6} {'--':>6}"
+                    row += f"  {'--':>7} {'--':>7} {'--':>7}"
                 else:
-                    row += (f"  {ep['tpr_per'][cls_id]:>6.2f} "
-                            f"{ep['fpr_per'][cls_id]:>6.2f} "
-                            f"{ep['acc_per'][cls_id]:>6.2f}")
+                    row += (f"  {ep['tpr_per'][cls_id]:>7.3f} "
+                            f"{ep['fpr_per'][cls_id]:>7.3f} "
+                            f"{ep['acc_per'][cls_id]:>7.3f}")
             print(row)
 
     print()
